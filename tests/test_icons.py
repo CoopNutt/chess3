@@ -50,10 +50,10 @@ class TestIcons(unittest.TestCase):
         _reset_style()
 
     def test_constants(self):
-        """20 types, 6 player colors of valid (r, g, b) tuples."""
-        self.assertEqual(len(icons.TYPE_ORDER), 20)
-        self.assertEqual(len(set(icons.TYPE_ORDER)), 20)
-        for new_type in ("CT", "VA", "GO", "JG", "SN", "WD"):
+        """21 types, 6 player colors of valid (r, g, b) tuples."""
+        self.assertEqual(len(icons.TYPE_ORDER), 21)
+        self.assertEqual(len(set(icons.TYPE_ORDER)), 21)
+        for new_type in ("CT", "VA", "GO", "JG", "SN", "WD", "SK"):
             self.assertIn(new_type, icons.TYPE_ORDER)
         self.assertEqual(len(icons.PLAYER_COLORS), 6)
         for color in icons.PLAYER_COLORS:
@@ -87,15 +87,15 @@ class TestIcons(unittest.TestCase):
             icons.draw_piece(surf, "XX", (200, 0, 0), 36, (32, 32))
 
     def test_preview_size_sane(self):
-        """render_all_preview returns a 20-col x 6-row grid of `cell` px."""
+        """render_all_preview returns a 21-col x 6-row grid of `cell` px."""
         for cell in (48, 64):
             surf = icons.render_all_preview(cell)
-            self.assertEqual(surf.get_width(), 20 * cell)
+            self.assertEqual(surf.get_width(), 21 * cell)
             self.assertEqual(surf.get_height(),
                              len(icons.PLAYER_COLORS) * cell)
 
     def test_glyphs_pairwise_distinct(self):
-        """Same-color renders of all 20 types differ pixel-for-pixel."""
+        """Same-color renders of all 21 types differ pixel-for-pixel."""
         color = icons.PLAYER_COLORS[3]  # blue
         bufs = {}
         for ptype in icons.TYPE_ORDER:
@@ -213,6 +213,123 @@ class TestStyle(unittest.TestCase):
                         ink=(7, 8, 9), glyph=(10, 11, 12))
         _render_bytes("Q")
         self.assertEqual([tuple(c) for c in icons.PLAYER_COLORS], before)
+
+
+class TestTombstone(unittest.TestCase):
+    """SPEC V4.3: draw_tombstone renders graveyard tiles."""
+
+    @classmethod
+    def setUpClass(cls):
+        pygame.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        pygame.quit()
+
+    def _render(self, size, pad=40):
+        side = size + 2 * pad
+        surf = pygame.Surface((side, side), pygame.SRCALPHA)
+        icons.draw_tombstone(surf, (side // 2, side // 2), size)
+        return surf
+
+    def test_renders_non_blank_at_small_sizes(self):
+        """Draws something at cell size 30 (and larger)."""
+        for size in (30, 48, 64):
+            surf = self._render(size)
+            rect = surf.get_bounding_rect()
+            self.assertGreater(rect.width, 0,
+                               "tombstone at size %d drew nothing" % size)
+            # tall enough to actually read as a gravestone
+            self.assertGreaterEqual(rect.height, int(size * 0.5))
+
+    def test_deterministic(self):
+        """Two identical calls produce identical pixels."""
+        a = pygame.image.tobytes(self._render(48), "RGBA")
+        b = pygame.image.tobytes(self._render(48), "RGBA")
+        self.assertEqual(a, b)
+
+    def test_stays_within_tile(self):
+        """All painted pixels stay inside a ~size box around center."""
+        for size in (30, 48):
+            surf = self._render(size)
+            cx = cy = surf.get_width() // 2
+            rect = surf.get_bounding_rect()
+            m = int(size * 0.55) + 2
+            self.assertGreaterEqual(rect.left, cx - m)
+            self.assertGreaterEqual(rect.top, cy - m)
+            self.assertLessEqual(rect.right, cx + m)
+            self.assertLessEqual(rect.bottom, cy + m)
+
+
+class TestCracks(unittest.TestCase):
+    """SPEC V4.3: draw_cracks — deterministic per-cell crack art."""
+
+    @classmethod
+    def setUpClass(cls):
+        pygame.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        pygame.quit()
+
+    def _render(self, cell, size=40, pad=30, color=(20, 18, 16)):
+        side = size * 2 + 2 * pad
+        surf = pygame.Surface((side, side), pygame.SRCALPHA)
+        icons.draw_cracks(surf, cell, (side // 2, side // 2), size,
+                          color=color)
+        return surf
+
+    def test_renders_non_blank(self):
+        for cell in ((0, 0), (3, -2), (-5, 11)):
+            surf = self._render(cell)
+            self.assertGreater(surf.get_bounding_rect().width, 0,
+                               "cracks for %r drew nothing" % (cell,))
+
+    def test_same_cell_identical_every_call(self):
+        """Same seed cell -> pixel-identical cracks on every call."""
+        for cell in ((0, 0), (7, -3), (-11, 4)):
+            a = pygame.image.tobytes(self._render(cell), "RGBA")
+            b = pygame.image.tobytes(self._render(cell), "RGBA")
+            self.assertEqual(a, b, "cracks for %r not deterministic"
+                             % (cell,))
+
+    def test_independent_of_global_random_state(self):
+        """Global random seeding never changes the output, and the global
+        random state is not disturbed by drawing."""
+        import random as _random
+        _random.seed(111)
+        a = pygame.image.tobytes(self._render((2, 5)), "RGBA")
+        _random.seed(999)
+        b = pygame.image.tobytes(self._render((2, 5)), "RGBA")
+        self.assertEqual(a, b)
+        # drawing must not consume/perturb the global stream
+        _random.seed(424242)
+        state = _random.getstate()
+        self._render((6, -1))
+        self.assertEqual(_random.getstate(), state)
+
+    def test_different_cells_differ(self):
+        """Distinct seed cells produce distinct crack layouts."""
+        base = pygame.image.tobytes(self._render((0, 0)), "RGBA")
+        others = [(1, 0), (0, 1), (5, -3), (-4, 9)]
+        diffs = sum(
+            1 for c in others
+            if pygame.image.tobytes(self._render(c), "RGBA") != base)
+        self.assertGreaterEqual(diffs, 3)
+
+    def test_stays_within_reach_of_center(self):
+        """Every painted pixel lies within ~0.9 * size of center."""
+        for cell in ((0, 0), (4, -7), (12, 3)):
+            for size in (30, 48):
+                surf = self._render(cell, size=size)
+                cx = cy = surf.get_width() // 2
+                lw = max(1, int(round(size / 14.0)))
+                limit = 0.9 * size + lw + 2
+                rect = surf.get_bounding_rect()
+                self.assertGreaterEqual(rect.left, cx - limit)
+                self.assertGreaterEqual(rect.top, cy - limit)
+                self.assertLessEqual(rect.right, cx + limit + 1)
+                self.assertLessEqual(rect.bottom, cy + limit + 1)
 
 
 if __name__ == "__main__":

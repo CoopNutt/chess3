@@ -282,8 +282,10 @@ class TestNewTroops(unittest.TestCase):
         self.assertEqual(len(raises), 6)
         ok, err = gs.apply_move(0, raises[0])
         self.assertTrue(ok, err)
-        pawn = gs.board[raises[0].to]
-        self.assertEqual((pawn.type, pawn.owner, pawn.moved), ("P", 0, True))
+        # v4: the necromancer raises a SKELETON (fresh, uses=0), not a pawn
+        risen = gs.board[raises[0].to]
+        self.assertEqual((risen.type, risen.owner, risen.moved, risen.uses),
+                         ("SK", 0, True, 0))
         self.assertNotIn("P", gs.lost[0])
         self.assertEqual(gs.board[(0, 0)].type, "NE")  # did not move
 
@@ -887,6 +889,343 @@ class TestQuietStart(unittest.TestCase):
                 assert_quiet(self, gs, "%s n=%d swap %r" % (shape, n, sw))
 
 
+class TestSkeleton(unittest.TestCase):
+    """V4.1: SK moves like its owner's pawn (no double-step, no promotion)
+    and crumbles to dust after its 3rd completed move."""
+
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    def test_names_and_descriptions(self):
+        self.assertEqual(engine.PIECE_NAMES["SK"], "Skeleton")
+        self.assertIn("SK", engine.PIECE_DESCRIPTIONS)
+        self.assertIn("3", engine.PIECE_DESCRIPTIONS["SK"])   # crumble count
+        self.assertIn("SKELETON", engine.PIECE_DESCRIPTIONS["NE"])
+        self.assertIn("10", engine.PIECE_DESCRIPTIONS["BM"])  # the fuse
+
+    def test_moves_like_a_pawn_but_no_double_step(self):
+        gs = self.gs
+        gs.board[(0, 3)] = Piece("SK", 0)      # unmoved: STILL no double
+        tos = set(moves_to(gs, (0, 3)))
+        self.assertEqual(tos, {(0, 2), (1, 2)})
+        # captures ONLY on the 3 forward diagonals
+        gs.board[(1, 1)] = Piece("N", 1)       # F1+F2
+        gs.board[(-1, 2)] = Piece("B", 1)      # 2F1-F2
+        gs.board[(2, 2)] = Piece("R", 1)       # 2F2-F1
+        gs.board[(1, 3)] = Piece("P", 1)       # beside it: not capturable
+        tos = set(moves_to(gs, (0, 3)))
+        self.assertEqual(tos, {(0, 2), (1, 2), (1, 1), (-1, 2), (2, 2)})
+        # and quiet moves cannot go to an (empty) capture diagonal
+        del gs.board[(1, 1)]
+        self.assertNotIn((1, 1), set(moves_to(gs, (0, 3))))
+
+    def test_crumbles_after_third_completed_move(self):
+        gs = self.gs
+        gs.board[(0, 3)] = Piece("SK", 0, moved=True)
+        for step, dest in enumerate(((0, 2), (0, 1), (0, 0)), start=1):
+            gs.turn_pid = 0
+            ok, err = gs.apply_move(0, Move((0, dest[1] + 1), dest))
+            self.assertTrue(ok, err)
+            if step < 3:
+                self.assertEqual(gs.board[dest].uses, step)
+        self.assertNotIn((0, 0), gs.board)     # crumbled after move 3
+        self.assertIn("SK", gs.lost[0])
+        self.assertTrue(any("crumbles to dust" in ln for ln in gs.log))
+
+    def test_capturing_on_the_third_move_still_crumbles(self):
+        gs = self.gs
+        gs.board[(0, 3)] = Piece("SK", 0, moved=True, uses=2)
+        gs.board[(1, 1)] = Piece("N", 1)       # forward-diagonal victim
+        ok, err = gs.apply_move(0, Move((0, 3), (1, 1)))
+        self.assertTrue(ok, err)
+        self.assertNotIn((1, 1), gs.board)     # took the N, then crumbled
+        self.assertIn("N", gs.lost[1])
+        self.assertIn("SK", gs.lost[0])
+
+    def test_never_promotes(self):
+        gs = self.gs
+        gs.board[(0, -5)] = Piece("SK", 0, moved=True)
+        ok, err = gs.apply_move(0, Move((0, -5), (0, -6)))
+        self.assertTrue(ok, err)
+        # a pawn ending on this far-edge cell becomes a Queen; SK never does
+        self.assertEqual(gs.board[(0, -6)].type, "SK")
+        self.assertEqual(gs.board[(0, -6)].uses, 1)
+
+    def test_raised_skeleton_lives_for_exactly_three_moves(self):
+        gs = self.gs
+        gs.board[(0, 3)] = Piece("NE", 0)
+        gs.lost[0].append("P")
+        rz = [m for m in gs.legal_moves((0, 3))
+              if m.kind == "raise" and m.to == (0, 2)]
+        ok, err = gs.apply_move(0, rz[0])
+        self.assertTrue(ok, err)
+        for dest in ((0, 1), (0, 0), (0, -1)):
+            gs.turn_pid = 0
+            ok, err = gs.apply_move(0, Move((0, dest[1] + 1), dest))
+            self.assertTrue(ok, err)
+        self.assertNotIn((0, -1), gs.board)
+        self.assertEqual(gs.lost[0], ["SK"])   # the P was consumed, SK died
+
+
+class TestBomberFuse(unittest.TestCase):
+    """V4.1: a bomber detonates at its destination when its 10th completed
+    move resolves; a capture-explosion beforehand ends the fuse."""
+
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    def test_fuse_detonates_on_exactly_the_10th_move(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("BM", 0, moved=True, uses=8)
+        ok, err = gs.apply_move(0, Move((0, 0), (1, 0)))   # 9th move
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(1, 0)].type, "BM")      # still ticking
+        self.assertFalse(any("fuse" in ln for ln in gs.log))
+        gs.board[(2, 1)] = Piece("N", 1)    # adjacent to the blast: dies
+        gs.board[(1, 1)] = Piece("P", 0)    # own piece adjacent: dies too
+        gs.board[(3, 0)] = Piece("GO", 1)   # golem adjacent: shrugs it off
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((1, 0), (2, 0)))   # 10th move
+        self.assertTrue(ok, err)
+        self.assertNotIn((2, 0), gs.board)  # went up with its own blast
+        self.assertNotIn((2, 1), gs.board)
+        self.assertNotIn((1, 1), gs.board)
+        self.assertEqual(gs.board[(3, 0)].type, "GO")
+        self.assertIn("BM", gs.lost[0])
+        self.assertIn("P", gs.lost[0])
+        self.assertIn("N", gs.lost[1])
+        self.assertTrue(any("fuse runs out" in ln for ln in gs.log))
+        self.assertTrue(any("BOOM" in ln for ln in gs.log))
+
+    def test_capture_explosion_ends_the_fuse_no_double_fire(self):
+        for uses in (3, 9):    # incl. a capture on what would be move 10
+            gs = fresh(2)
+            clear_keep_kings(gs)
+            gs.turn_pid = 0
+            gs.board[(0, 0)] = Piece("BM", 0, moved=True, uses=uses)
+            gs.board[(1, 0)] = Piece("N", 1)
+            ok, err = gs.apply_move(0, Move((0, 0), (1, 0)))
+            self.assertTrue(ok, err)
+            self.assertNotIn((1, 0), gs.board)
+            self.assertEqual(gs.lost[0].count("BM"), 1, uses)
+            self.assertEqual(sum(1 for ln in gs.log if "BOOM" in ln), 1,
+                             uses)
+            self.assertFalse(any("fuse" in ln for ln in gs.log), uses)
+
+
+class TestGraveyards(unittest.TestCase):
+    """V4.1: dead players curse tiles; graveyards wall off all movement
+    except skeleton moves and necromancer raise targets."""
+
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    def test_new_game_has_no_graveyards(self):
+        gs = fresh(3)
+        self.assertEqual(gs.graveyards, set())
+        self.assertEqual(gs.graves_left, {})
+
+    def test_apply_grave_validation_matrix(self):
+        gs = fresh(3)
+        turn_before = gs.turn_pid
+        # alive players may not curse (even with a cell that would be fine)
+        ok, err = gs.apply_grave(0, (0, 0))
+        self.assertFalse(ok)
+        # unknown player
+        self.assertFalse(gs.apply_grave(99, (0, 0))[0])
+        # malformed cell
+        self.assertFalse(gs.apply_grave(0, "nope")[0])
+        gs.eliminate(1, "test")
+        self.assertEqual(gs.graves_left[1], 1)  # granted ON elimination
+        # occupied cell rejected
+        occupied = next(iter(gs.board))
+        self.assertFalse(gs.apply_grave(1, occupied)[0])
+        # off-board cell rejected
+        self.assertFalse(gs.apply_grave(1, (99, 99))[0])
+        self.assertEqual(gs.graves_left[1], 1)  # failures consume nothing
+        # dead player OK — not turn-based, does not advance the turn
+        ok, err = gs.apply_grave(1, (0, 0))
+        self.assertTrue(ok, err)
+        self.assertIn((0, 0), gs.graveyards)
+        self.assertEqual(gs.graves_left[1], 0)
+        self.assertEqual(gs.turn_pid, turn_before)
+        self.assertIsNone(gs.winner)
+        self.assertTrue(any("curses a tile from beyond the grave" in ln
+                            for ln in gs.log))
+        # second grave rejected (only one curse per death)
+        self.assertFalse(gs.apply_grave(1, (1, 0))[0])
+        # a "grave" pseudo-move cannot be smuggled through apply_move
+        ok, err = gs.apply_move(gs.turn_pid, Move((0, 0), (0, 0), "grave"))
+        self.assertFalse(ok)
+        # another dead player: same cell rejected, a fresh cell is fine
+        gs.eliminate(2, "test")   # ends the game (0 wins) — curse still OK
+        self.assertFalse(gs.apply_grave(2, (0, 0))[0])
+        self.assertTrue(gs.apply_grave(2, (1, 0))[0])
+        self.assertEqual(gs.graveyards, {(0, 0), (1, 0)})
+
+    def test_move_from_dict_accepts_grave_kind(self):
+        m = Move.from_dict({"from": [2, 3], "to": [2, 3], "kind": "grave"})
+        self.assertEqual(m.kind, "grave")
+        with self.assertRaises(ValueError):
+            Move.from_dict({"from": [0, 0], "to": [0, 0], "kind": "bogus"})
+
+    def test_slides_and_charges_stop_before_a_graveyard(self):
+        gs = self.gs
+        gs.graveyards.add((2, 0))
+        gs.board[(0, 0)] = Piece("R", 0)
+        tos = set(moves_to(gs, (0, 0)))
+        self.assertIn((1, 0), tos)
+        self.assertNotIn((2, 0), tos)
+        self.assertNotIn((3, 0), tos)          # the ray is walled off
+        gs.board[(3, 0)] = Piece("N", 1)       # enemy behind the wall
+        self.assertNotIn((3, 0), set(moves_to(gs, (0, 0))))
+        gs.board[(0, 0)] = Piece("BM", 0)      # short slider, same wall
+        tos = set(moves_to(gs, (0, 0)))
+        self.assertIn((1, 0), tos)
+        self.assertNotIn((2, 0), tos)
+        gs.board[(0, 0)] = Piece("JG", 0)      # charge: stops before it
+        tos = set(moves_to(gs, (0, 0)))
+        self.assertIn((1, 0), tos)             # last empty before the wall
+        self.assertNotIn((2, 0), tos)
+        self.assertNotIn((3, 0), tos)          # cannot smash through
+
+    def test_jumps_exclude_graveyards_but_leap_over_them(self):
+        gs = self.gs
+        gs.graveyards.update([(1, 0), (3, -1)])
+        gs.board[(0, 0)] = Piece("N", 0)
+        tos = set(moves_to(gs, (0, 0)))
+        self.assertNotIn((3, -1), tos)         # knight can't land on one
+        self.assertIn((3, -2), tos)
+        gs.board[(0, 0)] = Piece("WZ", 0)
+        tos = set(moves_to(gs, (0, 0)))
+        self.assertNotIn((1, 0), tos)          # teleports can't land either
+        self.assertIn((2, 0), tos)             # but LEAP right over it
+        gs.board[(0, 0)] = Piece("CH", 0)
+        tos = set(moves_to(gs, (0, 0)))
+        self.assertNotIn((1, 0), tos)
+        self.assertIn((2, 0), tos)             # 2-ortho leap over the grave
+        gs.board[(0, 0)] = Piece("K", 0)
+        self.assertNotIn((1, 0), set(moves_to(gs, (0, 0))))
+
+    def test_pawn_blocked_by_graveyards(self):
+        gs = self.gs
+        gs.board[(0, 3)] = Piece("P", 0)       # unmoved, seat 0
+        gs.graveyards.add((0, 2))              # on the F1 step
+        tos = set(moves_to(gs, (0, 3)))
+        self.assertEqual(tos, {(1, 2), (2, 1)})  # F1 single AND double gone
+        gs.graveyards.discard((0, 2))
+        gs.graveyards.add((0, 1))              # only the F1 DOUBLE target
+        tos = set(moves_to(gs, (0, 3)))
+        self.assertEqual(tos, {(0, 2), (1, 2), (2, 1)})
+
+    def test_ghost_phases_through_but_cannot_land(self):
+        gs = self.gs
+        gs.graveyards.add((1, 1))
+        gs.board[(0, 0)] = Piece("GH", 0)
+        gs.board[(2, 2)] = Piece("R", 1)
+        tos = set(moves_to(gs, (0, 0)))
+        self.assertNotIn((1, 1), tos)          # can't land on the grave
+        self.assertIn((2, 2), tos)             # phases through, captures
+        self.assertIn((3, 3), tos)
+
+    def test_cannon_ray_walled_by_graveyard(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("CN", 0)
+        gs.board[(1, 0)] = Piece("P", 0)       # screen
+        gs.board[(3, 0)] = Piece("N", 1)       # target beyond the screen
+        self.assertIn((3, 0), set(moves_to(gs, (0, 0))))
+        gs.graveyards.add((2, 0))              # wall between screen+target
+        self.assertNotIn((3, 0), set(moves_to(gs, (0, 0))))
+
+    def test_skeleton_enters_graveyards_and_can_be_shot_there(self):
+        gs = self.gs
+        gs.graveyards.add((0, 2))
+        gs.board[(0, 3)] = Piece("SK", 0, moved=True)
+        self.assertIn((0, 2), set(moves_to(gs, (0, 3))))
+        ok, err = gs.apply_move(0, Move((0, 3), (0, 2)))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 2)].type, "SK")  # standing on a grave
+        # a rook cannot reach it (the slide stops before the graveyard)...
+        gs.board[(0, -1)] = Piece("R", 1)
+        self.assertNotIn((0, 2), {m.to for m in gs.legal_moves((0, -1))})
+        # ...but shoots target the PIECE, so the archer takes the shot
+        gs.board[(0, 0)] = Piece("AR", 1)
+        shoots = [m for m in gs.legal_moves((0, 0)) if m.kind == "shoot"]
+        self.assertIn((0, 2), {m.to for m in shoots})
+        gs.turn_pid = 1
+        ok, err = gs.apply_move(1, Move((0, 0), (0, 2), "shoot"))
+        self.assertTrue(ok, err)
+        self.assertNotIn((0, 2), gs.board)
+        self.assertIn("SK", gs.lost[0])
+        self.assertIn((0, 2), gs.graveyards)   # the tile stays cursed
+
+    def test_raise_targets_include_graveyards(self):
+        gs = self.gs
+        gs.graveyards.add((1, 0))
+        gs.board[(0, 0)] = Piece("NE", 0)
+        gs.lost[0].append("P")
+        mvs = gs.legal_moves((0, 0))
+        raises = {m.to for m in mvs if m.kind == "raise"}
+        self.assertIn((1, 0), raises)          # skeletons rise from graves
+        ok, err = gs.apply_move(0, Move((0, 0), (1, 0), "raise"))
+        self.assertTrue(ok, err)
+        sk = gs.board[(1, 0)]
+        self.assertEqual((sk.type, sk.owner, sk.moved, sk.uses),
+                         ("SK", 0, True, 0))
+
+    def test_necromancer_diag_step_excludes_graveyards(self):
+        gs = self.gs
+        gs.graveyards.add((1, 1))
+        gs.board[(0, 0)] = Piece("NE", 0)
+        tos = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "move"}
+        self.assertNotIn((1, 1), tos)
+        self.assertIn((-1, -1), tos)
+
+
+class TestSerializationV4(unittest.TestCase):
+    def test_roundtrip_with_uses_and_graveyards(self):
+        gs = fresh(3)
+        bm = next(c for c, pc in gs.board.items()
+                  if pc.type == "BM" and pc.owner == 0)
+        gs.board[bm].uses = 7
+        gs.board[(0, 0)] = Piece("SK", 1, moved=True, uses=2)
+        gs.eliminate(2, "test")
+        ok, err = gs.apply_grave(2, (1, 0))
+        self.assertTrue(ok, err)
+        d = json.loads(json.dumps(gs.to_dict()))
+        self.assertTrue(all(len(row) == 6 for row in d["board"]))
+        self.assertIn([1, 0], d["graveyards"])
+        self.assertEqual(d["graves_left"], {"2": 0})
+        rt = GameState.from_dict(d)
+        self.assertEqual(rt.to_dict(), gs.to_dict())
+        self.assertEqual(rt.board[bm].uses, 7)
+        self.assertEqual(rt.board[(0, 0)].uses, 2)
+        self.assertEqual(rt.graveyards, {(1, 0)})
+        self.assertEqual(rt.graves_left, {2: 0})
+
+    def test_from_dict_accepts_old_5_element_rows(self):
+        gs = fresh(2)
+        d = json.loads(json.dumps(gs.to_dict()))
+        for row in d["board"]:
+            self.assertEqual(len(row), 6)
+            del row[5]
+        d.pop("graveyards")
+        d.pop("graves_left")
+        rt = GameState.from_dict(d)
+        self.assertEqual(len(rt.board), len(gs.board))
+        self.assertTrue(all(pc.uses == 0 for pc in rt.board.values()))
+        self.assertEqual(rt.graveyards, set())
+        self.assertEqual(rt.graves_left, {})
+        # and it upgrades forward into the exact v4 schema
+        self.assertEqual(rt.to_dict(), gs.to_dict())
+
+
 class TestFuzz(unittest.TestCase):
     def test_random_playouts_hold_invariants(self):
         rng = random.Random(1234)
@@ -967,6 +1306,77 @@ class TestFuzz(unittest.TestCase):
                     json.loads(json.dumps(gs.to_dict())))
                 self.assertEqual(rt.shape, shape)
                 self.assertEqual(rt.to_dict(), gs.to_dict())
+
+    def test_random_playouts_with_raises_and_graves(self):
+        """V4: games featuring necromancer raises (SK on the board) and a
+        mid-game elimination followed by apply_grave, invariants intact."""
+        rng = random.Random(20260712)
+        raises_seen = 0
+        graves_seen = 0
+        for n, forced_kill_ply in ((3, 50), (4, 70), (3, 30)):
+            gs = fresh(n)
+            cells = engine.board_cells(gs.radius)
+            for ply in range(400):
+                if gs.winner is not None:
+                    break
+                # a forced mid-game elimination (the disconnect path) makes
+                # sure the graveyard flow runs in every playout
+                if ply == forced_kill_ply:
+                    victims = [p["pid"] for p in gs.players
+                               if p["alive"] and p["pid"] != gs.turn_pid]
+                    if victims:
+                        gs.eliminate(rng.choice(victims), "disconnected")
+                    if gs.winner is not None:
+                        break
+                # every dead player spends their curse mid-game
+                for p in gs.players:
+                    pid = p["pid"]
+                    if p["alive"] or gs.graves_left.get(pid, 0) < 1:
+                        continue
+                    free = sorted(c for c in cells if c not in gs.board
+                                  and c not in gs.graveyards)
+                    ok, err = gs.apply_grave(pid, rng.choice(free))
+                    self.assertTrue(ok, err)
+                    graves_seen += 1
+                    # the fresh curse may have walled in the player to move
+                    if (gs.winner is None
+                            and not gs.all_legal_moves(gs.turn_pid)):
+                        gs.force_skip(gs.turn_pid)
+                if gs.winner is not None:
+                    break
+                mover = gs.turn_pid
+                all_mv = gs.all_legal_moves(mover)
+                self.assertTrue(all_mv)
+                rz = [m for m in all_mv if m.kind == "raise"]
+                if rz and rng.random() < 0.8:
+                    mv = rng.choice(rz)
+                    raises_seen += 1
+                else:
+                    mv = rng.choice(all_mv)
+                ok, err = gs.apply_move(mover, mv)
+                self.assertTrue(ok, err)
+                self.assertTrue(gs.graveyards <= cells)
+                for c, pc in gs.board.items():
+                    self.assertIn(c, cells)
+                    self.assertTrue(gs._is_alive(pc.owner))
+                    self.assertIn(pc.type, engine.PIECE_NAMES)
+                    if c in gs.graveyards:   # only skeletons stand on graves
+                        self.assertEqual(pc.type, "SK")
+                for types in gs.lost.values():
+                    for t in types:
+                        self.assertIn(t, engine.PIECE_NAMES)
+                for pc in gs.board.values():
+                    if pc.type == "SK":
+                        self.assertLess(pc.uses, 3)   # crumbled otherwise
+                    if pc.type == "BM":
+                        self.assertLess(pc.uses, 10)  # detonated otherwise
+                if gs.winner is None:
+                    self.assertTrue(gs._is_alive(gs.turn_pid))
+                rt = GameState.from_dict(
+                    json.loads(json.dumps(gs.to_dict())))
+                self.assertEqual(rt.to_dict(), gs.to_dict())
+        self.assertGreater(graves_seen, 0)
+        self.assertGreater(raises_seen, 0)
 
 
 if __name__ == "__main__":

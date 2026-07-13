@@ -14,11 +14,17 @@ soft halo ring behind the disc (``glow``) and recolor the glyph linework
 defaults render exactly like the classic look. PLAYER_COLORS are never
 touched by styling (player identification).
 
+V4.3 adds the SK Skeleton glyph (21 types), ``draw_tombstone`` for
+graveyard tiles, and ``draw_cracks`` for deterministic cracked-tile
+overlays (seeded purely from the cell coords so every client draws the
+exact same cracks — the global ``random`` state is never touched).
+
 This is one of the only two modules allowed to import pygame (with main.py).
 """
 
 import math
 import os
+import random
 
 import pygame
 
@@ -74,11 +80,11 @@ PLAYER_COLORS = [
     (158, 84, 214),
 ]
 
-# Canonical display order of the 20 piece types (v2 adds CT, VA, GO;
-# v3 adds JG, SN, WD).
+# Canonical display order of the 21 piece types (v2 adds CT, VA, GO;
+# v3 adds JG, SN, WD; v4 adds SK — the necromancer-raised skeleton).
 TYPE_ORDER = ["K", "Q", "R", "B", "N", "P",
               "CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE",
-              "CT", "VA", "GO", "JG", "SN", "WD"]
+              "CT", "VA", "GO", "JG", "SN", "WD", "SK"]
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +479,28 @@ def _g_warden(surf, cx, cy, s, ow):
     _ink_disc(surf, cx, cy, s, 0.26, -0.36, 0.06)
 
 
+def _g_skeleton(surf, cx, cy, s, ow):
+    """Small skull over a ribcage hint: spine, three rib bars, jaw.
+
+    Distinct from NE (one big skull): the SK skull is small and sits on
+    top of visible bones.
+    """
+    # spine down the middle (drawn first so the ribs/skull overlap it)
+    _stick(surf, cx, cy, s, (0.0, -0.12), (0.0, 0.76), 0.10, ow=ow)
+    # three rib bars, widest at the top
+    for y, half in ((0.16, 0.42), (0.38, 0.33), (0.60, 0.22)):
+        _stick(surf, cx, cy, s, (-half, y), (half, y), 0.10, ow=ow)
+    # jaw
+    _poly(surf, cx, cy, s,
+          [(-0.18, -0.36), (0.18, -0.36), (0.13, -0.14), (-0.13, -0.14)],
+          ow=ow)
+    # small cranium
+    _disc(surf, cx, cy, s, 0.0, -0.54, 0.32, ow=ow)
+    # eye sockets
+    _ink_disc(surf, cx, cy, s, -0.13, -0.56, 0.08)
+    _ink_disc(surf, cx, cy, s, 0.13, -0.56, 0.08)
+
+
 _GLYPHS = {
     "K": _g_king,
     "Q": _g_queen,
@@ -494,6 +522,7 @@ _GLYPHS = {
     "JG": _g_juggernaut,
     "SN": _g_sniper,
     "WD": _g_warden,
+    "SK": _g_skeleton,
 }
 
 
@@ -516,7 +545,7 @@ def draw_piece(surface, ptype, body_color, size, center):
 
     Args:
         surface: any pygame.Surface (no display required).
-        ptype: one of the 20 type ids ("K", "Q", ..., "JG", "SN", "WD").
+        ptype: one of the 21 type ids ("K", "Q", ..., "SN", "WD", "SK").
         body_color: (r, g, b) body color, e.g. an entry of PLAYER_COLORS.
         size: target diameter in pixels (glyphs stay readable down to ~24).
         center: (x, y) pixel center of the piece.
@@ -560,14 +589,14 @@ def draw_piece(surface, ptype, body_color, size, center):
 
 
 def render_all_preview(cell=48):
-    """Render a grid of all 20 piece types in all 6 player colors.
+    """Render a grid of all 21 piece types in all 6 player colors.
 
-    Columns are the 20 types in TYPE_ORDER; rows are the 6 PLAYER_COLORS.
+    Columns are the 21 types in TYPE_ORDER; rows are the 6 PLAYER_COLORS.
     Cells alternate dark/light backgrounds so glyph readability can be
     checked on both. Used by the help screen and for manual eyeballing.
 
     Returns:
-        A pygame.Surface of size (20 * cell, 6 * cell).
+        A pygame.Surface of size (21 * cell, 6 * cell).
     """
     cols = len(TYPE_ORDER)
     rows = len(PLAYER_COLORS)
@@ -581,6 +610,142 @@ def render_all_preview(cell=48):
             draw_piece(surf, ptype, color, int(cell * 0.82),
                        (col * cell + cell // 2, row * cell + cell // 2))
     return surf
+
+
+# ---------------------------------------------------------------------------
+# V4.3 graveyard art
+# ---------------------------------------------------------------------------
+
+# Tombstone palette: grays with a dark outline (independent of STYLE —
+# graveyard tiles look the same in every theme).
+_STONE = (158, 158, 166)
+_STONE_SHADE = (120, 120, 130)
+_MOUND = (99, 99, 108)
+_GRAVE_INK = (36, 36, 42)
+
+
+def draw_tombstone(surface, center, size):
+    """Draw a graveyard tombstone fitting a ~``size`` px box at ``center``.
+
+    A rounded gravestone (dark outline, shaded slab with a lit face)
+    bearing an engraved cross, rising out of a small dirt mound. Pure
+    pygame.draw primitives, readable down to cell size ~30, works
+    headless on plain Surfaces.
+
+    Args:
+        surface: any pygame.Surface (no display required).
+        center: (x, y) pixel center of the tile.
+        size: target height/width in pixels (the art spans ~0.95 * size
+            vertically and ~size horizontally, centered on ``center``).
+    """
+    cx = int(round(center[0]))
+    cy = int(round(center[1]))
+    s = max(10, int(size))
+    ow = max(1, int(round(s / 18.0)))
+
+    # gravestone slab with a rounded top
+    w = max(6, int(round(s * 0.60)))
+    h = max(8, int(round(s * 0.78)))
+    slab = pygame.Rect(0, 0, w, h)
+    slab.midbottom = (cx, cy + int(round(s * 0.34)))
+    rad = max(2, w // 2 - 1)
+    pygame.draw.rect(surface, _STONE_SHADE, slab,
+                     border_top_left_radius=rad, border_top_right_radius=rad)
+    lit = slab.inflate(-2 * ow - 2, -2 * ow - 2).move(-ow, -ow)
+    if lit.width > 2 and lit.height > 2:
+        lrad = max(1, lit.width // 2 - 1)
+        pygame.draw.rect(surface, _STONE, lit,
+                         border_top_left_radius=lrad,
+                         border_top_right_radius=lrad)
+    pygame.draw.rect(surface, _GRAVE_INK, slab, width=ow,
+                     border_top_left_radius=rad, border_top_right_radius=rad)
+
+    # engraved cross
+    lw = max(1, int(round(s * 0.07)))
+    v_top = cy - int(round(s * 0.28))
+    v_bot = cy + int(round(s * 0.04))
+    arm = int(round(s * 0.12))
+    arm_y = cy - int(round(s * 0.17))
+    pygame.draw.line(surface, _GRAVE_INK, (cx, v_top), (cx, v_bot), lw)
+    pygame.draw.line(surface, _GRAVE_INK,
+                     (cx - arm, arm_y), (cx + arm, arm_y), lw)
+
+    # small dirt mound over the slab base
+    mound = pygame.Rect(0, 0, max(8, int(round(s * 0.92))),
+                        max(4, int(round(s * 0.28))))
+    mound.center = (cx, cy + int(round(s * 0.34)))
+    pygame.draw.ellipse(surface, _MOUND, mound)
+    pygame.draw.ellipse(surface, _GRAVE_INK, mound, ow)
+
+
+def draw_cracks(surface, seed_cell, center, size, color=(20, 18, 16)):
+    """Draw deterministic jagged cracks radiating from near ``center``.
+
+    2-4 jagged polyline branches (some with a short fork) fan out from
+    near the middle of the tile, every point staying within ~0.9 * size
+    of ``center`` (inside the hex cell). The layout is a pure function
+    of ``seed_cell``: the (q, r) ints are hashed into a seed for a LOCAL
+    ``random.Random`` instance, so the same cell produces pixel-identical
+    cracks on every call and every client, and the global ``random``
+    module state is neither read nor disturbed.
+
+    Args:
+        surface: any pygame.Surface (no display required).
+        seed_cell: (q, r) axial cell coords — the determinism seed.
+        center: (x, y) pixel center of the tile.
+        size: tile size in pixels; cracks stay within ~0.9 * size.
+        color: (r, g, b) crack line color (default near-black).
+    """
+    q, r = int(seed_cell[0]), int(seed_cell[1])
+    # mix the coords into a seed with plain integer arithmetic (stable
+    # across runs, platforms and clients; no str hashing involved)
+    seed = ((q * 73856093) ^ (r * 19349663) ^ 0x5BD1E995) & 0xFFFFFFFF
+    rng = random.Random(seed)
+
+    cx, cy = float(center[0]), float(center[1])
+    s = float(size)
+    reach = 0.9 * s
+    col = tuple(int(c) for c in color[:3])
+    lw = max(1, int(round(s / 14.0)))
+
+    def clamp(x, y):
+        """Pull (x, y) back onto the reach circle if it escaped it."""
+        d = math.hypot(x - cx, y - cy)
+        if d > reach and d > 0.0:
+            f = reach / d
+            x = cx + (x - cx) * f
+            y = cy + (y - cy) * f
+        return x, y
+
+    n = 2 + rng.randrange(3)                      # 2..4 branches
+    base = rng.uniform(0.0, 2.0 * math.pi)
+    for i in range(n):
+        # branches fan out evenly (with jitter) so they never collapse
+        # into one line
+        ang = base + i * (2.0 * math.pi / n) + rng.uniform(-0.35, 0.35)
+        d0 = rng.uniform(0.04, 0.14) * s          # start near the center
+        x = cx + d0 * math.cos(ang)
+        y = cy + d0 * math.sin(ang)
+        pts = [(x, y)]
+        for _ in range(3 + rng.randrange(3)):     # 3..5 jagged segments
+            ang += rng.uniform(-0.55, 0.55)
+            step = rng.uniform(0.16, 0.30) * s
+            x, y = clamp(x + step * math.cos(ang), y + step * math.sin(ang))
+            pts.append((x, y))
+        ipts = [(int(round(px)), int(round(py))) for px, py in pts]
+        pygame.draw.lines(surface, col, False, ipts, lw)
+        # occasional short fork off a mid-point for extra jaggedness
+        if len(pts) >= 3 and rng.random() < 0.6:
+            fx, fy = pts[1 + rng.randrange(len(pts) - 2)]
+            fang = ang + rng.uniform(0.7, 1.6) * (1 if rng.random() < 0.5
+                                                  else -1)
+            fstep = rng.uniform(0.12, 0.22) * s
+            tx, ty = clamp(fx + fstep * math.cos(fang),
+                           fy + fstep * math.sin(fang))
+            pygame.draw.line(surface, col,
+                             (int(round(fx)), int(round(fy))),
+                             (int(round(tx)), int(round(ty))),
+                             max(1, lw - 1))
 
 
 if __name__ == "__main__":

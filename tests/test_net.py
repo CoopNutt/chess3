@@ -1,10 +1,14 @@
 """Networking tests: lobby codes + a real multi-client game over localhost."""
+import contextlib
 import json
 import os
 import queue
 import random
+import shutil
 import socket
 import sys
+import tempfile
+import threading
 import time
 import unittest
 
@@ -338,10 +342,11 @@ class TestMatchSettings(unittest.TestCase):
 
 
 class TestVersionGate(unittest.TestCase):
-    """v3: protocol version 3 enforced at hello (new piece types on the wire).
+    """v4: protocol version 4 enforced at hello (Skeletons + graveyards
+    cross the wire, so v3 clients are now kicked too).
 
-    The kick message text is unchanged from v2 — old clients must still get
-    a readable "grab the new exe" hint.
+    The kick message text is unchanged — old clients must still get a
+    readable "grab the new exe" hint.
     """
 
     def setUp(self):
@@ -353,11 +358,11 @@ class TestVersionGate(unittest.TestCase):
         self.server.close()
         time.sleep(0.1)
 
-    def test_protocol_version_is_3(self):
-        self.assertEqual(net.PROTOCOL_VERSION, 3)
+    def test_protocol_version_is_4(self):
+        self.assertEqual(net.PROTOCOL_VERSION, 4)
 
     def test_old_version_kicked(self):
-        for old_ver in (1, 2):
+        for old_ver in (1, 2, 3):
             reply = raw_hello(self.port,
                               {"t": "hello", "name": "Old", "ver": old_ver})
             self.assertEqual(reply["t"], "kicked")
@@ -369,7 +374,7 @@ class TestVersionGate(unittest.TestCase):
         self.assertIn("version mismatch", reply["reason"])
 
     def test_current_version_welcomed(self):
-        c = net.NetClient()   # sends ver = PROTOCOL_VERSION = 3
+        c = net.NetClient()   # sends ver = PROTOCOL_VERSION = 4
         c.connect("127.0.0.1", self.port, "New", timeout=5.0)
         self.assertEqual(c.pid, 1)
         c.close()
@@ -705,6 +710,315 @@ class TestPresence(unittest.TestCase):
         self.assertEqual(svc._threads, [])   # no threads were spawned
         svc.close()                     # must NOT raise
         self.assertTrue(svc.events.empty())
+
+
+class TestGraveFlow(unittest.TestCase):
+    """v4: dead players curse tiles through the wire.
+
+    Bob is eliminated by a scripted king capture — the authoritative board
+    is nudged under the server lock, then the capture is submitted through
+    the NORMAL move path — so his NetClient stays CONNECTED and can send
+    the grave message afterwards (a disconnected player has no socket).
+    """
+
+    def setUp(self):
+        self.port = free_port()
+        self.server = net.HostServer("Host", self.port)
+        self.server.start()
+        self.clients = []
+
+    def tearDown(self):
+        for c in self.clients:
+            c.close()
+        self.server.close()
+        time.sleep(0.1)
+
+    def join(self, name):
+        c = net.NetClient()
+        c.connect("127.0.0.1", self.port, name, timeout=5.0)
+        self.clients.append(c)
+        return c
+
+    def _start_three(self):
+        """Host + Ann + Bob, game running; returns (ann, bob)."""
+        ann = self.join("Ann")
+        bob = self.join("Bob")
+        ok, err = self.server.start_game()
+        self.assertTrue(ok, err)
+        wait_for(self.server.events, "start")
+        wait_for(ann.events, "start")
+        wait_for(bob.events, "start")
+        return ann, bob
+
+    def _eliminate_bob(self, ann, bob):
+        """Scripted king capture over the wire; returns the converged state.
+
+        Teleports Bob's king and the host's queen to the empty board centre
+        (3p radius-7 hexagon: armies hug their edges, the middle is free),
+        then the host captures the king via submit_host_move. Bob is
+        eliminated but still connected; every queue is drained of the
+        resulting state broadcast so later steps see clean queues.
+        """
+        with self.server._lock:
+            gs = self.server._gs
+            self.assertEqual(gs.turn_pid, 0)   # fresh game: host to move
+            bk = next(c for c, pc in gs.board.items()
+                      if pc.owner == bob.pid and pc.type == "K")
+            hq = next(c for c, pc in gs.board.items()
+                      if pc.owner == 0 and pc.type == "Q")
+            self.assertNotIn((0, 0), gs.board)
+            self.assertNotIn((1, 0), gs.board)
+            gs.board[(0, 0)] = gs.board.pop(bk)
+            gs.board[(1, 0)] = gs.board.pop(hq)
+        self.server.submit_host_move(engine.Move((1, 0), (0, 0)).to_dict())
+        sh = wait_for(self.server.events, "state")["state"]
+        sa = wait_for(ann.events, "state")["state"]
+        sb = wait_for(bob.events, "state")["state"]
+        self.assertEqual(sh, sa)
+        self.assertEqual(sh, sb)
+        dead = next(p for p in sh["players"] if p["pid"] == bob.pid)
+        self.assertFalse(dead["alive"])
+        self.assertFalse(any(row[3] == bob.pid for row in sh["board"]))
+        self.assertIsNone(sh["winner"])   # host + Ann still playing
+        self.assertEqual(sh["graves_left"][str(bob.pid)], 1)
+        self.assertEqual(sh["graveyards"], [])
+        return sh
+
+    def test_grave_flow_and_rejections(self):
+        ann, bob = self._start_three()
+        sd = self._eliminate_bob(ann, bob)
+        turn_before = sd["turn_pid"]
+        self.assertEqual(turn_before, ann.pid)   # capture advanced the turn
+
+        # -- alive players cannot curse (client + host entry points) --
+        ann.send_grave([0, 1])
+        err = wait_for(ann.events, "error")
+        self.assertIn("dead", err["msg"].lower())
+        self.server.submit_host_grave([0, 1])
+        err = wait_for(self.server.events, "error")
+        self.assertIn("dead", err["msg"].lower())
+
+        # -- occupied cell: the host queen sits on (0,0) after the capture --
+        bob.send_grave([0, 0])
+        err = wait_for(bob.events, "error")
+        self.assertIn("occupied", err["msg"].lower())
+
+        # -- off-board cell --
+        bob.send_grave([99, 99])
+        err = wait_for(bob.events, "error")
+        self.assertIn("board", err["msg"].lower())
+
+        # -- malformed payloads are rejected, never crash the server --
+        for bad in (None, 7, "xy", [1], [1, 2, 3], {"q": 0, "r": 1},
+                    ["a", "b"], [None, None]):
+            bob.send_grave(bad)
+            err = wait_for(bob.events, "error")
+            self.assertIn("malformed", err["msg"].lower(),
+                          "bad cell %r" % (bad,))
+
+        # -- the real curse: all three participants converge --
+        bob.send_grave((0, 1))
+        mh = wait_for(self.server.events, "state")
+        ma = wait_for(ann.events, "state")
+        mb = wait_for(bob.events, "state")
+        self.assertEqual(mh["state"], ma["state"])
+        self.assertEqual(mh["state"], mb["state"])
+        want_last = {"pid": bob.pid, "move": {"from": [0, 1], "to": [0, 1],
+                                              "kind": "grave"}}
+        self.assertEqual(mh["last_move"], want_last)
+        self.assertEqual(ma["last_move"], want_last)
+        sd = mh["state"]
+        self.assertEqual(sd["graveyards"], [[0, 1]])
+        self.assertEqual(sd["graves_left"][str(bob.pid)], 0)
+        self.assertIsNone(sd["winner"])
+        self.assertEqual(sd["turn_pid"], turn_before)   # NOT turn-based
+        self.assertTrue(any("curses a tile from beyond the grave" in line
+                            and "Bob" in line for line in sd["log"]))
+        gs = engine.GameState.from_dict(sd)
+        self.assertIn((0, 1), gs.graveyards)
+
+        # -- a dead player gets exactly one curse --
+        bob.send_grave([2, 0])
+        err = wait_for(bob.events, "error")
+        self.assertIn("no curses left", err["msg"].lower())
+
+        # -- play continues over the cursed board and still converges --
+        gs = engine.GameState.from_dict(mh["state"])
+        self.assertEqual(gs.turn_pid, ann.pid)
+        mv = random.Random(11).choice(gs.all_legal_moves(ann.pid))
+        ann.send_move(mv.to_dict())
+        mh = wait_for(self.server.events, "state")
+        ma = wait_for(ann.events, "state")
+        mb = wait_for(bob.events, "state")
+        self.assertEqual(mh["state"], ma["state"])
+        self.assertEqual(mh["state"], mb["state"])
+        self.assertEqual(mh["state"]["graveyards"], [[0, 1]])
+
+    def test_grave_rejected_before_game_starts(self):
+        bob = self.join("Bob")
+        bob.send_grave([0, 0])
+        err = wait_for(bob.events, "error")
+        self.assertIn("not started", err["msg"].lower())
+
+    def test_sk_rows_cross_the_wire(self):
+        """v4 serialization: a Skeleton (6-element board row incl. `uses`)
+        survives the trip through the wire byte-identically."""
+        ann = self.join("Ann")
+        ok, err = self.server.start_game()
+        self.assertTrue(ok, err)
+        wait_for(self.server.events, "start")
+        wait_for(ann.events, "start")
+        with self.server._lock:
+            gs = self.server._gs
+            self.assertNotIn((0, 0), gs.board)
+            gs.board[(0, 0)] = engine.Piece("SK", 0, moved=True, uses=2)
+            # a host move that does NOT touch the skeleton (a 3rd move
+            # would crumble it) — any other piece's move works
+            mv = next(m for m in gs.all_legal_moves(0)
+                      if m.from_ != (0, 0))
+        self.server.submit_host_move(mv.to_dict())
+        sh = wait_for(self.server.events, "state")["state"]
+        sa = wait_for(ann.events, "state")["state"]
+        self.assertEqual(sh, sa)
+        row = next(r for r in sa["board"] if r[2] == "SK")
+        self.assertEqual(list(row), [0, 0, "SK", 0, 1, 2])
+        piece = engine.GameState.from_dict(sa).board[(0, 0)]
+        self.assertEqual((piece.type, piece.owner, piece.moved, piece.uses),
+                         ("SK", 0, True, 2))
+
+
+@contextlib.contextmanager
+def one_shot_http(status, body, content_length=None):
+    """Serve exactly ONE canned HTTP response on a loopback socket.
+
+    Yields the base URL. `content_length` may LIE (bigger than the body) to
+    simulate a connection dropped mid-download.
+    """
+    ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(1)
+    ls.settimeout(5.0)
+    port = ls.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _addr = ls.accept()
+        except OSError:
+            return
+        try:
+            conn.settimeout(5.0)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                head += chunk
+            n = len(body) if content_length is None else content_length
+            reply = ("HTTP/1.1 %d Canned\r\n"
+                     "Content-Type: application/octet-stream\r\n"
+                     "Content-Length: %d\r\n"
+                     "Connection: close\r\n\r\n" % (status, n))
+            conn.sendall(reply.encode("ascii") + body)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        yield "http://127.0.0.1:%d" % port
+    finally:
+        try:
+            ls.close()
+        except OSError:
+            pass
+        t.join(5.0)
+
+
+class TestReleaseHelpers(unittest.TestCase):
+    """v4: get_latest_release / download_file error paths.
+
+    NEVER touches real GitHub: net.GITHUB_API is repointed at localhost
+    (unroutable ports and one-shot canned responses only).
+    """
+
+    def setUp(self):
+        self._old_api = net.GITHUB_API
+        self.addCleanup(lambda: setattr(net, "GITHUB_API", self._old_api))
+        self.tmp = tempfile.mkdtemp(prefix="chess3-net-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_repo_constant(self):
+        self.assertEqual(net.GITHUB_REPO, "CoopNutt/chess3")
+
+    def test_release_check_unroutable_is_none(self):
+        net.GITHUB_API = "http://127.0.0.1:%d" % free_port()  # nothing listens
+        t0 = time.time()
+        self.assertIsNone(net.get_latest_release(timeout=2.0))
+        self.assertLess(time.time() - t0, 5.0)
+
+    def test_release_check_bad_responses_are_none(self):
+        exe_less = {"tag_name": "v4.0.0", "body": "x", "assets": [
+            {"name": "source.zip",
+             "browser_download_url": "http://127.0.0.1:9/s.zip"}]}
+        cases = [
+            (404, b'{"message":"Not Found"}'),            # no release yet
+            (403, b'{"message":"API rate limit exceeded"}'),
+            (500, b"boom"),
+            (200, b"not json at all"),
+            (200, b"[1,2,3]"),                            # wrong JSON shape
+            (200, b'{"assets":[]}'),                      # no tag
+            (200, b'{"tag_name":"v4","assets":[]}'),      # no assets
+            (200, json.dumps(exe_less).encode("utf-8")),  # no .exe asset
+        ]
+        for status, body in cases:
+            with one_shot_http(status, body) as base:
+                net.GITHUB_API = base
+                self.assertIsNone(net.get_latest_release(timeout=3.0),
+                                  "HTTP %d %r" % (status, body[:40]))
+
+    def test_release_check_parses_canned_release(self):
+        rel = {"tag_name": "v4.1.0", "body": "bug fixes",
+               "assets": [
+                   {"name": "notes.txt",
+                    "browser_download_url": "http://127.0.0.1:9/notes.txt"},
+                   {"name": "Chess3.exe",
+                    "browser_download_url": "http://127.0.0.1:9/Chess3.exe"},
+               ]}
+        with one_shot_http(200, json.dumps(rel).encode("utf-8")) as base:
+            net.GITHUB_API = base
+            got = net.get_latest_release(timeout=3.0)
+        self.assertEqual(got, {"tag": "v4.1.0",
+                               "url": "http://127.0.0.1:9/Chess3.exe",
+                               "notes": "bug fixes"})
+
+    def test_download_unroutable_is_false_and_leaves_no_file(self):
+        dest = os.path.join(self.tmp, "Chess3_new.exe")
+        url = "http://127.0.0.1:%d/Chess3.exe" % free_port()
+        self.assertFalse(net.download_file(url, dest, timeout=2.0))
+        self.assertFalse(os.path.exists(dest))
+
+    def test_download_streams_all_chunks(self):
+        payload = bytes(random.Random(4).randrange(256)
+                        for _ in range(200 * 1024))   # several 64K chunks
+        dest = os.path.join(self.tmp, "ok.exe")
+        with one_shot_http(200, payload) as base:
+            self.assertTrue(net.download_file(base + "/Chess3.exe", dest,
+                                              timeout=5.0))
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_download_truncated_removes_partial_file(self):
+        dest = os.path.join(self.tmp, "partial.exe")
+        # server promises 1 MB but hangs up after 3 bytes
+        with one_shot_http(200, b"abc", content_length=1024 * 1024) as base:
+            self.assertFalse(net.download_file(base + "/Chess3.exe", dest,
+                                               timeout=5.0))
+        self.assertFalse(os.path.exists(dest), "partial file left behind")
 
 
 if __name__ == "__main__":

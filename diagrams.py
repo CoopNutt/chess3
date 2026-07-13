@@ -20,7 +20,10 @@ ghost gets a mid-ray blocker, the bomber gets a capture target (with the
 6 explosion cells hatched orange — decoration mandated by the spec,
 derived from the movegen capture), and the necromancer gets one lost pawn
 so raise markers appear. The warden diagram is its bare 12 king-steps.
-Pawns use seat edge 0, so "forward" is up.
+The v4 skeleton gets an enemy on each of its 3 forward capture diagonals,
+so its diagram shows the pawn-style stab pattern plus the two quiet
+forward steps. Pawns (and the skeleton) use seat edge 0, so "forward"
+is up.
 
 Surfaces are cached per (ptype, width, icons style fingerprint) — V3.3
 theme styling changes the pieces, so a style change misses the old cache
@@ -84,6 +87,10 @@ _DEMO_ENEMIES = {
     # blocker on the first diag step + targets at exactly 2 diag steps
     # (the sniper shoots straight over the blocker)
     "SN": (((1, 1), "P"), ((2, 2), "P"), ((-4, 2), "P")),
+    # v4 skeleton: an enemy on each of the 3 forward capture diagonals
+    # of seat edge 0 (F1=(0,-1), F2=(1,-1)); the two forward steps stay
+    # empty so the quiet markers show too
+    "SK": (((1, -2), "P"), ((-1, -1), "P"), ((2, -1), "P")),
 }
 
 # Per-type friendly pieces (owner 0, drawn in the demo blue). The
