@@ -1,0 +1,11 @@
+# build artifacts (regenerate with build.bat)
+build/
+dist/
+__pycache__/
+*.pyc
+Chess3.spec
+chess3.ico
+chess3.png
+
+# local test junk
+*.log

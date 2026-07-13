@@ -1,0 +1,973 @@
+"""Engine rules tests: crafted-position tests for all new troops (v1's 8 +
+v2's CT/VA/GO + v3's JG/SN/WD), board-shape geometry, swaps, timers, quiet
+starts for every (shape, player count), and randomized full-game fuzzing."""
+import json
+import os
+import random
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import engine
+from engine import GameState, Move, Piece
+
+
+def fresh(n=2):
+    return GameState.new_game([(i, "P%d" % i) for i in range(n)])
+
+
+def clear_keep_kings(gs, far=True):
+    """Empty the board except kings parked far apart (so no accidental wins)."""
+    gs.board.clear()
+    R = gs.radius
+    gs.board[(-R, 0)] = Piece("K", 0)
+    gs.board[(R, 0)] = Piece("K", 1)
+
+
+def moves_to(gs, cell):
+    return {m.to: m for m in gs.legal_moves(cell)}
+
+
+def new_shaped(n, shape, swaps=None):
+    return GameState.new_game([(i, "P%d" % i) for i in range(n)],
+                              shape=shape, swaps=swaps)
+
+
+def assert_quiet(tc, gs, label):
+    """No displacements, full armies, and no capture/shoot/promo for anyone."""
+    tc.assertEqual(gs.displacements, 0, "%s: armies collide" % label)
+    tc.assertEqual(len(gs.board), engine.ARMY_SIZE * len(gs.players),
+                   "%s: pieces missing" % label)
+    for p in gs.players:
+        pid = p["pid"]
+        for mv in gs.all_legal_moves(pid):
+            tc.assertNotEqual(mv.kind, "shoot",
+                              "%s pid%d shoot %r" % (label, pid, mv))
+            if mv.kind != "move":
+                continue
+            tc.assertNotIn(mv.to, gs.board,
+                           "%s pid%d capture %r" % (label, pid, mv))
+            if gs.board[mv.from_].type == "P":
+                tc.assertFalse(gs._promotes(mv.to, pid),
+                               "%s pid%d instant promo %r" % (label, pid, mv))
+
+
+class TestGeometry(unittest.TestCase):
+    def test_cell_counts(self):
+        for r, n in ((6, 127), (7, 169), (8, 217), (9, 271)):
+            self.assertEqual(len(engine.board_cells(r)), n)
+
+    def test_edge_rows_on_board(self):
+        for edge in range(6):
+            for row in range(3):
+                cells = engine.edge_row(edge, 9, row)
+                self.assertEqual(len(cells), 10 + row)
+                for c in cells:
+                    self.assertIn(c, engine.board_cells(9))
+
+    def test_rotate60_identity(self):
+        for cell in [(3, -2), (0, 0), (-9, 4)]:
+            self.assertEqual(engine.rotate60(cell, 6), cell)
+
+
+class TestSetup(unittest.TestCase):
+    def test_army_counts_all_player_counts(self):
+        for n in range(2, 7):
+            gs = fresh(n)
+            self.assertEqual(len(gs.board), 24 * n)
+            for pid in range(n):
+                mine = [pc for pc in gs.board.values() if pc.owner == pid]
+                self.assertEqual(len(mine), 24)
+                types = sorted(pc.type for pc in mine)
+                self.assertEqual(types.count("K"), 1)
+                self.assertEqual(types.count("P"), 9)
+                for nt in ("CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE"):
+                    self.assertEqual(types.count(nt), 1, nt)
+
+    def test_serialization_roundtrip(self):
+        gs = fresh(6)
+        rt = GameState.from_dict(json.loads(json.dumps(gs.to_dict())))
+        self.assertEqual(rt.to_dict(), gs.to_dict())
+
+    def test_serialization_carries_shape(self):
+        gs = new_shaped(3, "square")
+        d = json.loads(json.dumps(gs.to_dict()))
+        self.assertEqual(d["shape"], "square")
+        rt = GameState.from_dict(d)
+        self.assertEqual(rt.shape, "square")
+        self.assertEqual(rt.to_dict(), gs.to_dict())
+        d.pop("shape")                      # v1 dicts have no shape key
+        self.assertEqual(GameState.from_dict(d).shape, "hexagon")
+
+
+class TestPawn(unittest.TestCase):
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+
+    def test_steps_and_double(self):
+        gs = self.gs
+        gs.board[(0, 3)] = Piece("P", 0)  # seat 0: F1=(0,-1) F2=(1,-1)
+        tos = set(moves_to(gs, (0, 3)))
+        self.assertEqual(tos, {(0, 2), (1, 2), (0, 1), (2, 1)})
+        gs.board[(0, 2)] = Piece("P", 0)  # block F1
+        tos = set(moves_to(gs, (0, 3)))
+        self.assertEqual(tos, {(1, 2), (2, 1)})
+        gs.board[(0, 3)].moved = True
+        gs.board.pop((0, 2))
+        tos = set(moves_to(gs, (0, 3)))
+        self.assertEqual(tos, {(0, 2), (1, 2)})
+
+    def test_captures_only_on_forward_diagonals(self):
+        gs = self.gs
+        gs.board[(0, 3)] = Piece("P", 0, moved=True)
+        # F1+F2=(1,-2), 2F1-F2=(-1,-1), 2F2-F1=(2,-1) from (0,3)
+        for d in ((1, 1), (-1, 2), (2, 2)):
+            gs.board[(0 + d[0], 3 + d[1])] = Piece("N", 1)
+        self.assertEqual({m.to for m in gs.legal_moves((0, 3)) if (m.to in gs.board)},
+                         set())
+        gs.board[(1, 1)] = Piece("N", 1)   # 0,3 + (1,-2)
+        gs.board[(-1, 2)] = Piece("N", 1)  # + (-1,-1)
+        gs.board[(2, 2)] = Piece("N", 1)   # + (2,-1)
+        caps = {m.to for m in gs.legal_moves((0, 3)) if m.to in gs.board}
+        self.assertEqual(caps, {(1, 1), (-1, 2), (2, 2)})
+        # cannot quiet-move onto a capture diagonal
+        gs.board.pop((1, 1))
+        caps = {m.to for m in gs.legal_moves((0, 3)) if m.to == (1, 1)}
+        self.assertEqual(caps, set())
+
+    def test_promotion(self):
+        gs = self.gs
+        gs.board[(0, -5)] = Piece("P", 0, moved=True)
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((0, -5), (0, -6)))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, -6)].type, "Q")
+
+    def test_no_promotion_on_own_edge(self):
+        gs = self.gs
+        # seat 0 home edge is r = +6; a pawn moving along it stays a pawn
+        gs.board[(-3, 6)] = Piece("P", 0, moved=True)
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((-3, 6), (-3, 5)))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(-3, 5)].type, "P")
+
+
+class TestNewTroops(unittest.TestCase):
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    def test_cannon_slides_but_cannot_slide_capture(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("CN", 0)
+        gs.board[(3, 0)] = Piece("N", 1)
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((2, 0), tos)          # slide up to the screen
+        self.assertNotIn((3, 0), tos)       # cannot capture by sliding
+
+    def test_cannon_screen_jump(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("CN", 0)
+        gs.board[(2, 0)] = Piece("P", 0)    # screen (own piece ok)
+        gs.board[(4, 0)] = Piece("N", 1)    # target beyond screen
+        gs.board[(5, 0)] = Piece("R", 1)    # beyond target: unreachable
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((4, 0), tos)
+        self.assertNotIn((5, 0), tos)
+        ok, err = gs.apply_move(0, tos[(4, 0)])
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(4, 0)].type, "CN")
+        self.assertIn("N", gs.lost[1])
+
+    def test_archer_shoots_over_blockers_and_never_move_captures(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("AR", 0)
+        gs.board[(1, 0)] = Piece("R", 1)    # adjacent enemy blocker
+        gs.board[(2, 0)] = Piece("N", 1)    # target at exactly 2
+        mvs = gs.legal_moves((0, 0))
+        shoot = [m for m in mvs if m.kind == "shoot"]
+        self.assertEqual({m.to for m in shoot}, {(2, 0)})
+        self.assertNotIn((1, 0), {m.to for m in mvs})  # no melee capture
+        ok, err = gs.apply_move(0, shoot[0])
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 0)].type, "AR")  # did not move
+        self.assertNotIn((2, 0), gs.board)
+
+    def test_wizard_teleports_over_walls(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("WZ", 0)
+        for d in engine.ORTHO:              # fully walled in
+            gs.board[(d[0], d[1])] = Piece("P", 1)
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((2, 0), tos)          # lands beyond the wall
+        self.assertIn((1, 0), tos)          # or captures the wall itself
+
+    def test_dragon_capped_at_3(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("DR", 0)
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((3, 0), tos)
+        self.assertNotIn((4, 0), tos)
+        self.assertIn((3, 3), tos)          # 3 diag steps of (1,1)
+        self.assertNotIn((4, 4), tos)
+
+    def test_champion_leaps(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("CH", 0)
+        gs.board[(1, 0)] = Piece("P", 1)    # blocker adjacent
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((2, 0), tos)          # leaps over it
+        self.assertIn((1, 0), tos)          # or captures it
+        self.assertIn((1, 1), tos)          # 1 diag
+        self.assertNotIn((3, 0), tos)
+
+    def test_bomber_capture_explodes_sparing_kings(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("BM", 0)
+        gs.board[(1, 0)] = Piece("N", 1)     # victim
+        gs.board[(2, 0)] = Piece("R", 1)     # adjacent to landing cell: dies
+        gs.board[(1, 1)] = Piece("P", 0)     # own piece adjacent: dies too
+        gs.board[(1, -1)] = Piece("K", 1)    # king adjacent: immune
+        # park the real enemy king cell clear (fresh board has it at (6,0))
+        ok, err = gs.apply_move(0, Move((0, 0), (1, 0)))
+        self.assertTrue(ok, err)
+        self.assertNotIn((1, 0), gs.board)   # bomber died in its own blast
+        self.assertNotIn((2, 0), gs.board)
+        self.assertNotIn((1, 1), gs.board)
+        self.assertEqual(gs.board[(1, -1)].type, "K")
+        self.assertIn("BM", gs.lost[0])
+        self.assertIn("P", gs.lost[0])
+        self.assertIn("R", gs.lost[1])
+
+    def test_bomber_chain_reaction(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("AR", 0)
+        gs.board[(2, 0)] = Piece("BM", 1)    # shot target
+        gs.board[(3, 0)] = Piece("BM", 1)    # adjacent bomber: chains
+        gs.board[(4, 0)] = Piece("N", 1)     # adjacent to 2nd bomber: dies
+        shoot = [m for m in gs.legal_moves((0, 0)) if m.kind == "shoot"][0]
+        ok, err = gs.apply_move(0, shoot)
+        self.assertTrue(ok, err)
+        for c in ((2, 0), (3, 0), (4, 0)):
+            self.assertNotIn(c, gs.board)
+
+    def test_ghost_phases_through(self):
+        gs = self.gs
+        # (-2,-2) -> (-1,-1), (0,0), (1,1); a 4th step (2,2) is on the
+        # board too, so the range cap (not the board edge) stops it.
+        gs.board[(-2, -2)] = Piece("GH", 0)
+        gs.board[(0, 0)] = Piece("R", 1)     # enemy on the 2nd ray cell
+        tos = moves_to(gs, (-2, -2))
+        self.assertIn((-1, -1), tos)
+        self.assertIn((0, 0), tos)           # capture on ray
+        self.assertIn((1, 1), tos)           # THROUGH the rook (3rd step)
+        self.assertNotIn((2, 2), tos)        # capped at GHOST_RANGE = 3
+        gs.board[(-1, -1)] = Piece("P", 0)   # friendly on ray
+        tos = moves_to(gs, (-2, -2))
+        self.assertNotIn((-1, -1), tos)      # can't land on friendly
+        self.assertIn((0, 0), tos)           # still passes through
+        self.assertIn((1, 1), tos)
+
+    def test_necromancer_raise(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("NE", 0)
+        self.assertEqual([m for m in gs.legal_moves((0, 0))
+                          if m.kind == "raise"], [])
+        gs.lost[0].append("P")
+        raises = [m for m in gs.legal_moves((0, 0)) if m.kind == "raise"]
+        self.assertEqual(len(raises), 6)
+        ok, err = gs.apply_move(0, raises[0])
+        self.assertTrue(ok, err)
+        pawn = gs.board[raises[0].to]
+        self.assertEqual((pawn.type, pawn.owner, pawn.moved), ("P", 0, True))
+        self.assertNotIn("P", gs.lost[0])
+        self.assertEqual(gs.board[(0, 0)].type, "NE")  # did not move
+
+
+class TestEliminationAndTurns(unittest.TestCase):
+    def test_king_capture_eliminates_and_wins_2p(self):
+        gs = fresh(2)
+        clear_keep_kings(gs)
+        gs.board[(5, 0)] = Piece("R", 0)
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((5, 0), (6, 0)))
+        self.assertTrue(ok, err)
+        self.assertFalse(gs._player(1)["alive"])
+        self.assertEqual([pc for pc in gs.board.values() if pc.owner == 1], [])
+        self.assertEqual(gs.winner, 0)
+
+    def test_king_capture_3p_continues(self):
+        gs = fresh(3)
+        gs.board.clear()
+        gs.board[(-5, 0)] = Piece("K", 0)
+        gs.board[(5, 0)] = Piece("K", 1)
+        gs.board[(0, 5)] = Piece("K", 2)
+        gs.board[(4, 0)] = Piece("R", 0)
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((4, 0), (5, 0)))
+        self.assertTrue(ok, err)
+        self.assertFalse(gs._player(1)["alive"])
+        self.assertIsNone(gs.winner)
+        self.assertEqual(gs.turn_pid, 2)
+
+    def test_moveless_player_skipped(self):
+        gs = fresh(3)
+        gs.board.clear()
+        R = gs.radius
+        gs.board[(-R, 0)] = Piece("K", 0)
+        gs.board[(R, 0)] = Piece("K", 2)
+        # player 1 alive but has no pieces at all -> no moves -> skipped
+        gs.turn_pid = 0
+        mv = gs.legal_moves((-R, 0))[0]
+        ok, err = gs.apply_move(0, mv)
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.turn_pid, 2)
+        self.assertTrue(any("skipped" in ln for ln in gs.log))
+
+    def test_disconnect_elimination_passes_turn(self):
+        gs = fresh(3)
+        victim = gs.turn_pid
+        gs.eliminate(victim, "disconnected")
+        self.assertFalse(gs._player(victim)["alive"])
+        self.assertNotEqual(gs.turn_pid, victim)
+        self.assertIsNone(gs.winner)
+
+
+class TestShapeGeometry(unittest.TestCase):
+    ALL = tuple(engine.SHAPE_NAMES)
+
+    def size_of(self, shape):
+        return max(engine.SHAPE_SIZE[shape].values())
+
+    def test_shape_cell_counts(self):
+        self.assertEqual(len(engine.shape_cells("square", 12)), 144)
+        self.assertEqual(len(engine.shape_cells("triangle", 5)), 21)
+        for r in (6, 9):
+            self.assertEqual(engine.shape_cells("hexagon", r),
+                             engine.board_cells(r))
+
+    def test_octagon_is_hexagon_minus_trimmed_corners(self):
+        R = 12
+        hexa = engine.board_cells(R)
+        octa = engine.shape_cells("octagon", R)
+        self.assertTrue(octa < hexa)
+        corners = [(cq * R, cr * R) for cq, cr in
+                   ((1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1))]
+        for c in hexa:
+            trimmed = any(engine.hex_dist(c, k) < engine.OCTAGON_TRIM
+                          for k in corners)
+            self.assertEqual(c not in octa, trimmed, c)
+
+    def test_edge_rows_lie_on_board_at_right_distance(self):
+        for shape in self.ALL:
+            size = self.size_of(shape)
+            cells = engine.shape_cells(shape, size)
+            for edge in range(engine.shape_num_edges(shape)):
+                for row in range(4):
+                    rc = engine.shape_edge_row(shape, edge, size, row)
+                    self.assertTrue(rc, (shape, edge, row))
+                    self.assertEqual(len(set(rc)), len(rc))
+                    for c in rc:
+                        self.assertIn(c, cells, (shape, edge, row, c))
+                        self.assertEqual(
+                            engine.shape_edge_dist(shape, c, edge, size),
+                            row, (shape, edge, row, c))
+                        self.assertEqual(
+                            engine.shape_on_edge_line(shape, c, edge, size),
+                            row == 0, (shape, edge, row, c))
+
+    def test_seats_valid_for_every_count(self):
+        for shape, sizes in engine.SHAPE_SIZE.items():
+            ne = engine.shape_num_edges(shape)
+            for n in sorted(sizes):
+                seats = engine.shape_seat_edges(shape, n)
+                self.assertEqual(len(seats), n)
+                self.assertEqual(len(set(seats)), n)
+                for s in seats:
+                    self.assertTrue(0 <= s < ne, (shape, n, s))
+        self.assertEqual(engine.SHAPE_MAX_PLAYERS,
+                         {"hexagon": 6, "octagon": 6,
+                          "square": 4, "triangle": 3})
+
+    def test_forwards_lead_away_from_own_edge(self):
+        for shape in self.ALL:
+            size = self.size_of(shape)
+            cells = engine.shape_cells(shape, size)
+            for edge in range(engine.shape_num_edges(shape)):
+                row0 = engine.shape_edge_row(shape, edge, size, 0)
+                mid = row0[len(row0) // 2]
+                for f in engine.shape_edge_forward(shape, edge):
+                    t = (mid[0] + f[0], mid[1] + f[1])
+                    self.assertIn(t, cells, (shape, edge, f))
+                    self.assertEqual(
+                        engine.shape_edge_dist(shape, t, edge, size), 1,
+                        (shape, edge, f))
+
+    def test_orient_square_puts_home_edge_on_canonical_line(self):
+        S = 12
+        cells = engine.shape_cells("square", S)
+        for seat in range(4):
+            mapped = {engine.shape_orient("square", c, seat, S)
+                      for c in cells}
+            self.assertEqual(mapped, cells)  # bijection on the board
+            for c in engine.shape_edge_row("square", seat, S, 0):
+                oq, orr = engine.shape_orient("square", c, seat, S)
+                self.assertEqual(orr, S - 1, (seat, c))
+
+    def test_orient_hexagon_matches_rotate60(self):
+        for seat in range(6):
+            for cell in ((3, -2), (0, 0), (-5, 1)):
+                self.assertEqual(
+                    engine.shape_orient("hexagon", cell, seat, 6),
+                    engine.rotate60(cell, seat))
+        self.assertEqual(engine.shape_orient("triangle", (2, 3), 1, 17),
+                         (2, 3))  # triangle never rotates
+
+    def test_promotion_zones(self):
+        # square: the OPPOSITE edge only
+        self.assertTrue(engine.shape_promotes("square", 0, (5, 0), 12))
+        self.assertFalse(engine.shape_promotes("square", 0, (0, 5), 12))
+        self.assertFalse(engine.shape_promotes("square", 0, (5, 11), 12))
+        self.assertTrue(engine.shape_promotes("square", 3, (11, 5), 12))
+        # triangle: boundary, not own edge, >= (2*T)//3 rows out
+        T = 17  # (2*17)//3 == 11
+        self.assertTrue(engine.shape_promotes("triangle", 0, (0, 12), T))
+        self.assertTrue(engine.shape_promotes("triangle", 0, (5, 12), T))
+        self.assertFalse(engine.shape_promotes("triangle", 0, (0, 5), T))
+        self.assertFalse(engine.shape_promotes("triangle", 0, (3, 12), T))
+        self.assertFalse(engine.shape_promotes("triangle", 0, (5, 0), T))
+        # octagon: hexagon far-edge rule, but trimmed cells never promote
+        self.assertTrue(engine.shape_promotes("octagon", 0, (6, -12), 12))
+        self.assertFalse(engine.shape_promotes("octagon", 0, (11, -12), 12))
+        self.assertFalse(engine.shape_promotes("octagon", 0, (6, 6), 12))
+
+
+class TestNewTroopsV2(unittest.TestCase):
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    def test_catapult_moves_one_step_and_shoots_at_exactly_3(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("CT", 0)
+        gs.board[(1, 0)] = Piece("P", 0)    # friendly blocker (irrelevant)
+        gs.board[(2, 0)] = Piece("P", 1)    # enemy at 2: NOT shootable
+        gs.board[(3, 0)] = Piece("R", 1)    # enemy at exactly 3: shootable
+        gs.board[(0, 2)] = Piece("N", 1)    # enemy at 2 on other ray: no
+        mvs = gs.legal_moves((0, 0))
+        shoots = {m.to for m in mvs if m.kind == "shoot"}
+        self.assertEqual(shoots, {(3, 0)})  # over both blockers
+        tos = {m.to for m in mvs if m.kind == "move"}
+        self.assertNotIn((2, 0), tos)       # cannot move-capture
+        self.assertNotIn((1, 0), tos)       # blocked by friendly
+        self.assertIn((0, 1), tos)          # plain 1-step to empty
+        self.assertNotIn((0, 2), tos)       # only 1 step
+        ok, err = gs.apply_move(0, Move((0, 0), (3, 0), "shoot"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 0)].type, "CT")  # did not move
+        self.assertNotIn((3, 0), gs.board)
+        self.assertIn("R", gs.lost[1])
+
+    def test_valkyrie_knight_jumps_or_one_diag(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("VA", 0)
+        gs.board[(1, 1)] = Piece("P", 0)     # friendly on a diag: blocked
+        gs.board[(3, -1)] = Piece("N", 1)    # enemy on a knight cell
+        gs.board[(-1, -1)] = Piece("B", 1)   # enemy on a diag cell
+        gs.board[(1, 0)] = Piece("P", 1)     # adjacent ortho: NOT reachable
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((3, -1), tos)          # knight capture
+        self.assertIn((-1, -1), tos)         # diag capture
+        self.assertNotIn((1, 1), tos)        # friendly-occupied
+        self.assertNotIn((1, 0), tos)        # no ortho move at all
+        self.assertNotIn((2, 2), tos)        # no 2-step diag
+        expected = set()
+        for dq, dr in engine.KNIGHT + engine.DIAG:
+            expected.add((dq, dr))
+        expected.discard((1, 1))
+        self.assertEqual(set(tos), expected)  # jumps ignore all blockers
+
+    def test_golem_moves_one_ortho_and_move_captures(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("GO", 0)
+        gs.board[(1, 0)] = Piece("N", 1)
+        tos = moves_to(gs, (0, 0))
+        self.assertEqual(set(tos),
+                         {(1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)})
+        ok, err = gs.apply_move(0, tos[(1, 0)])
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(1, 0)].type, "GO")
+        self.assertIn("N", gs.lost[1])
+
+    def test_golem_cannot_be_shot_but_can_be_captured(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("GO", 0)
+        gs.board[(2, 0)] = Piece("AR", 1)    # archer 2 away: no shot
+        gs.board[(0, 3)] = Piece("CT", 1)    # catapult 3 away: no shot
+        for cell in ((2, 0), (0, 3)):
+            kinds = [(m.kind, m.to) for m in gs.legal_moves(cell)]
+            self.assertNotIn(("shoot", (0, 0)), kinds, cell)
+        # a plain move-capture still works
+        gs.board[(0, 1)] = Piece("R", 1)
+        self.assertIn((0, 0), {m.to for m in gs.legal_moves((0, 1))})
+        gs.turn_pid = 1
+        ok, err = gs.apply_move(1, Move((0, 1), (0, 0)))
+        self.assertTrue(ok, err)
+        self.assertIn("GO", gs.lost[0])
+
+    def test_golem_survives_explosions(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("BM", 0)
+        gs.board[(1, 0)] = Piece("N", 1)     # bomber's victim
+        gs.board[(2, 0)] = Piece("GO", 1)    # adjacent golem: survives
+        gs.board[(1, 1)] = Piece("R", 1)     # adjacent rook: dies
+        ok, err = gs.apply_move(0, Move((0, 0), (1, 0)))
+        self.assertTrue(ok, err)
+        self.assertNotIn((1, 0), gs.board)   # bomber gone
+        self.assertNotIn((1, 1), gs.board)   # rook gone
+        self.assertEqual(gs.board[(2, 0)].type, "GO")
+        self.assertNotIn("GO", gs.lost[1])
+        self.assertIn("R", gs.lost[1])
+
+    def test_archer_still_shoots_non_golems(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("AR", 0)
+        gs.board[(2, 0)] = Piece("GO", 1)
+        gs.board[(0, 2)] = Piece("N", 1)
+        shoots = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "shoot"}
+        self.assertEqual(shoots, {(0, 2)})
+
+    def test_square_pawn_promotes_on_opposite_edge_only(self):
+        gs = new_shaped(2, "square")   # S=12, seats 0 (r=11) and 2 (r=0)
+        gs.board.clear()
+        gs.board[(0, 11)] = Piece("K", 0)
+        gs.board[(11, 0)] = Piece("K", 1)
+        gs.board[(5, 1)] = Piece("P", 0, moved=True)
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((5, 1), (5, 0)))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(5, 0)].type, "Q")
+        gs.winner = None
+        gs.board[(0, 5)] = Piece("P", 0, moved=True)
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((0, 5), (0, 4)))  # side edge q=0
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 4)].type, "P")
+
+
+class TestNewTroopsV3(unittest.TestCase):
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    # -- Juggernaut ----------------------------------------------------------
+
+    def test_juggernaut_charges_to_ray_endpoints_only(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("JG", 0)
+        tos = moves_to(gs, (0, 0))
+        # empty rays: ONLY the 5-step cap cell of each ortho ray
+        self.assertEqual(set(tos), {(5, 0), (-5, 0), (0, 5), (0, -5),
+                                    (-5, 5), (5, -5)})
+        for mid in ((1, 0), (2, 0), (3, 0), (4, 0)):
+            self.assertNotIn(mid, tos)      # cannot stop mid-ray
+        self.assertNotIn((1, 1), tos)       # no diagonal charges
+
+    def test_juggernaut_captures_first_enemy_or_stops_before_blocker(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("JG", 0)
+        gs.board[(3, 0)] = Piece("N", 1)    # enemy in range: capture
+        gs.board[(-2, 0)] = Piece("P", 0)   # friendly: stop on cell before
+        gs.board[(0, 1)] = Piece("R", 1)    # adjacent enemy: capture
+        gs.board[(0, -1)] = Piece("P", 0)   # adjacent friendly: ray is dead
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((3, 0), tos)
+        for c in ((1, 0), (2, 0), (4, 0), (5, 0)):
+            self.assertNotIn(c, tos)        # no mid-ray stop, no jump past
+        self.assertIn((-1, 0), tos)         # last empty before the friendly
+        self.assertNotIn((-2, 0), tos)
+        self.assertIn((0, 1), tos)
+        self.assertNotIn((0, -1), tos)
+        ok, err = gs.apply_move(0, tos[(3, 0)])
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(3, 0)].type, "JG")
+        self.assertIn("N", gs.lost[1])
+
+    def test_juggernaut_enemy_beyond_range_and_board_edge(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("JG", 0)
+        gs.board[(0, 6)] = Piece("N", 1)    # 6 steps out: beyond the cap
+        tos = moves_to(gs, (0, 0))
+        self.assertIn((0, 5), tos)          # stops at the 5-step cap
+        self.assertNotIn((0, 6), tos)
+        gs.board[(3, 2)] = Piece("JG", 0)   # (3,3) is the last on-board cell
+        tos = moves_to(gs, (3, 2))
+        self.assertIn((3, 3), tos)          # last empty before the edge
+        self.assertNotIn((3, 4), tos)
+
+    # -- Sniper --------------------------------------------------------------
+
+    def test_sniper_steps_one_diag_to_empty_and_shoots_at_exactly_2(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("SN", 0)
+        gs.board[(1, 1)] = Piece("R", 1)    # enemy 1 diag out: NOT capturable
+        gs.board[(2, 2)] = Piece("N", 1)    # exactly 2 diag steps: shootable
+        gs.board[(4, -2)] = Piece("B", 1)   # 2 steps on another diag: yes
+        gs.board[(-2, 4)] = Piece("GO", 1)  # golem at 2 diag steps: immune
+        mvs = gs.legal_moves((0, 0))
+        shoots = {m.to for m in mvs if m.kind == "shoot"}
+        self.assertEqual(shoots, {(2, 2), (4, -2)})   # right over the rook
+        tos = {m.to for m in mvs if m.kind == "move"}
+        self.assertNotIn((1, 1), tos)       # never move-captures
+        self.assertIn((-1, -1), tos)        # quiet 1-step diag
+        self.assertNotIn((-2, -2), tos)     # only 1 step
+        self.assertNotIn((1, 0), tos)       # no ortho moves at all
+        ok, err = gs.apply_move(0, Move((0, 0), (2, 2), "shoot"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 0)].type, "SN")  # did not move
+        self.assertNotIn((2, 2), gs.board)
+        self.assertEqual(gs.board[(1, 1)].type, "R")   # blocker untouched
+        self.assertIn("N", gs.lost[1])
+
+    # -- Warden --------------------------------------------------------------
+
+    def test_warden_moves_like_a_king(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("WD", 0)
+        gs.board[(1, 0)] = Piece("P", 1)    # enemy (not aura-protected)
+        gs.board[(0, 1)] = Piece("P", 0)    # friendly: blocked
+        tos = moves_to(gs, (0, 0))
+        expected = {d for d in engine.ORTHO + engine.DIAG} - {(0, 1)}
+        self.assertEqual(set(tos), {(dq, dr) for dq, dr in expected})
+        self.assertNotIn((2, 0), tos)       # one step only
+
+    def test_warden_aura_blocks_every_move_capture_generator(self):
+        # WD0 at (0,0) protects the N0 on its ortho-neighbor (1,0) from
+        # every kind="move" capture; removing the warden re-enables it.
+        cases = [
+            ("R", (1, 3), None),            # slide
+            ("N", (4, -1), None),           # knight jump
+            ("K", (2, 0), None),            # king step
+            ("WZ", (2, 1), None),           # teleport
+            ("VA", (2, 1), None),           # valkyrie diag jump
+            ("CH", (3, 0), None),           # champion 2-ortho leap
+            ("GH", (2, -2), None),          # ghost diag landing
+            ("BM", (2, 0), None),           # bomber 1-step capture
+            ("GO", (2, 0), None),           # golem stomp
+            ("WD", (2, 0), None),           # enemy warden's own step
+            ("P", (0, -1), None),           # pawn forward diagonal
+            ("CN", (1, 3), ((1, 2), "P")),  # cannon jump over a screen
+            ("JG", (1, 4), None),           # juggernaut charge
+        ]
+        for ptype, acell, extra in cases:
+            gs = fresh(2)
+            clear_keep_kings(gs)
+            gs.turn_pid = 1
+            gs.board[(0, 0)] = Piece("WD", 0)
+            gs.board[(1, 0)] = Piece("N", 0)
+            gs.board[acell] = Piece(ptype, 1, moved=True)
+            if extra:
+                gs.board[extra[0]] = Piece(extra[1], 1)
+            tos = {m.to for m in gs.legal_moves(acell) if m.kind == "move"}
+            self.assertNotIn((1, 0), tos, "%s pierced the aura" % ptype)
+            del gs.board[(0, 0)]            # warden gone: capture works
+            tos = {m.to for m in gs.legal_moves(acell) if m.kind == "move"}
+            self.assertIn((1, 0), tos, "%s should capture sans warden" % ptype)
+
+    def test_juggernaut_stops_before_warden_protected_enemy(self):
+        gs = self.gs
+        gs.turn_pid = 1
+        gs.board[(0, 0)] = Piece("WD", 0)
+        gs.board[(1, 0)] = Piece("N", 0)    # protected
+        gs.board[(1, 4)] = Piece("JG", 1)
+        tos = moves_to(gs, (1, 4))
+        self.assertNotIn((1, 0), tos)       # cannot smash the protected N
+        self.assertIn((1, 1), tos)          # skids to a stop right before it
+
+    def test_warden_aura_ignored_by_shoots(self):
+        gs = self.gs
+        gs.turn_pid = 1
+        gs.board[(0, 0)] = Piece("WD", 0)
+        gs.board[(1, 0)] = Piece("N", 0)     # protected from moves only
+        gs.board[(3, 0)] = Piece("AR", 1)    # archer: 2 ortho away
+        gs.board[(-1, -2)] = Piece("SN", 1)  # sniper: 2 diag away
+        gs.board[(4, 0)] = Piece("CT", 1)    # catapult: 3 ortho away
+        for shooter in ((3, 0), (-1, -2), (4, 0)):
+            shoots = {m.to for m in gs.legal_moves(shooter)
+                      if m.kind == "shoot"}
+            self.assertIn((1, 0), shoots, shooter)
+        ok, err = gs.apply_move(1, Move((3, 0), (1, 0), "shoot"))
+        self.assertTrue(ok, err)
+        self.assertNotIn((1, 0), gs.board)   # shot dead despite the aura
+        self.assertIn("N", gs.lost[0])
+
+    def test_warden_aura_ignored_by_explosions(self):
+        gs = self.gs
+        gs.turn_pid = 1
+        gs.board[(0, 0)] = Piece("WD", 0)
+        gs.board[(1, 0)] = Piece("N", 0)     # protected; adjacent to (2,0)
+        gs.board[(2, 0)] = Piece("P", 0)     # NOT protected (2 from warden)
+        gs.board[(3, 0)] = Piece("BM", 1)
+        ok, err = gs.apply_move(1, Move((3, 0), (2, 0)))
+        self.assertTrue(ok, err)
+        self.assertNotIn((2, 0), gs.board)   # bomber died in its own blast
+        self.assertNotIn((1, 0), gs.board)   # blast ignores the aura
+        self.assertEqual(gs.board[(0, 0)].type, "WD")  # 2 away: unhurt
+        self.assertIn("N", gs.lost[0])
+        self.assertIn("P", gs.lost[0])
+
+    def test_warden_does_not_protect_itself_but_pairs_guard_each_other(self):
+        gs = self.gs
+        gs.turn_pid = 1
+        gs.board[(0, 0)] = Piece("WD", 0)
+        gs.board[(0, 3)] = Piece("R", 1)
+        self.assertIn((0, 0), {m.to for m in gs.legal_moves((0, 3))})
+        gs.board[(1, 0)] = Piece("WD", 0)    # second warden, ortho-adjacent
+        self.assertNotIn((0, 0), {m.to for m in gs.legal_moves((0, 3))})
+        gs.board[(1, 3)] = Piece("R", 1)     # and the guard is mutual
+        self.assertNotIn((1, 0), {m.to for m in gs.legal_moves((1, 3))})
+
+    def test_warden_aura_is_same_owner_and_ortho_only(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("WD", 0)
+        gs.board[(1, 0)] = Piece("N", 1)     # ENEMY beside my warden
+        gs.board[(1, 3)] = Piece("R", 0)
+        # my warden does not shield enemy pieces from me
+        self.assertIn((1, 0), {m.to for m in gs.legal_moves((1, 3))})
+        gs.turn_pid = 1
+        gs.board[(1, 1)] = Piece("B", 0)     # friendly on a DIAG neighbor
+        gs.board[(4, 1)] = Piece("R", 1)     # clear ray along (-1, 0)
+        # diag-adjacency grants no protection (aura is ortho-only)
+        self.assertIn((1, 1), {m.to for m in gs.legal_moves((4, 1))})
+
+    def test_warden_aura_shields_king_from_danger_but_not_from_shots(self):
+        gs = self.gs                          # kings at (-6,0) and (6,0)
+        gs.board[(-6, 3)] = Piece("R", 1)     # attacks K0 down the q=-6 line
+        self.assertTrue(gs.king_in_danger(0))
+        gs.board[(-5, 0)] = Piece("WD", 0)    # warden beside the king
+        self.assertFalse(gs.king_in_danger(0))
+        gs.board[(-6, 2)] = Piece("AR", 1)    # archer shot hits the king
+        self.assertTrue(gs.king_in_danger(0))
+
+
+class TestSwaps(unittest.TestCase):
+    def test_swapped_armies_have_replacements(self):
+        swaps = {"CN": "CT", "GH": "VA", "NE": "GO"}
+        gs = GameState.new_game([(0, "a"), (1, "b")], swaps=swaps)
+        for pid in (0, 1):
+            types = [pc.type for pc in gs.board.values() if pc.owner == pid]
+            self.assertEqual(len(types), 24)
+            for gone in ("CN", "GH", "NE"):
+                self.assertNotIn(gone, types)
+            for added in ("CT", "VA", "GO"):
+                self.assertEqual(types.count(added), 1, added)
+            self.assertEqual(types.count("P"), 9)
+
+    def test_swaps_work_on_any_shape(self):
+        gs = new_shaped(4, "square", swaps={"AR": "GO"})
+        for pid in range(4):
+            types = [pc.type for pc in gs.board.values() if pc.owner == pid]
+            self.assertNotIn("AR", types)
+            self.assertEqual(types.count("GO"), 1)
+
+    def test_v3_swapped_armies_have_replacements(self):
+        swaps = {"CN": "JG", "GH": "WD", "AR": "SN"}
+        gs = GameState.new_game([(0, "a"), (1, "b")], swaps=swaps)
+        for pid in (0, 1):
+            types = [pc.type for pc in gs.board.values() if pc.owner == pid]
+            self.assertEqual(len(types), 24)
+            for gone in ("CN", "GH", "AR"):
+                self.assertNotIn(gone, types)
+            for added in ("JG", "WD", "SN"):
+                self.assertEqual(types.count(added), 1, added)
+            self.assertEqual(types.count("P"), 9)
+
+    def test_all_six_swap_troops_at_once(self):
+        swaps = {"CN": "CT", "AR": "SN", "WZ": "VA",
+                 "CH": "JG", "BM": "GO", "GH": "WD"}
+        gs = GameState.new_game([(0, "a"), (1, "b")], swaps=swaps)
+        types = [pc.type for pc in gs.board.values() if pc.owner == 0]
+        for rep in engine.SWAP_TROOPS:
+            self.assertEqual(types.count(rep), 1, rep)
+        self.assertEqual(len(types), 24)
+
+    def test_bad_swaps_rejected(self):
+        players = [(0, "a"), (1, "b")]
+        for bad in ({"P": "CT"}, {"K": "GO"},            # not swappable
+                    {"CN": "XX"}, {"CN": "Q"},           # bad replacement
+                    {"CN": "CT", "AR": "CT"},            # duplicate
+                    {"CN": "JG", "AR": "JG"}):           # v3 duplicate
+            with self.assertRaises(ValueError, msg=bad):
+                GameState.new_game(players, swaps=bad)
+
+    def test_unsupported_counts_and_shapes_rejected(self):
+        five = [(i, "p%d" % i) for i in range(5)]
+        four = five[:4]
+        with self.assertRaises(ValueError):
+            GameState.new_game(five, shape="square")
+        with self.assertRaises(ValueError):
+            GameState.new_game(four, shape="triangle")
+        with self.assertRaises(ValueError):
+            GameState.new_game(four, shape="pentagon")
+
+
+class TestTimers(unittest.TestCase):
+    def test_force_skip_advances_turn_and_logs(self):
+        gs = fresh(2)
+        gs.force_skip(1)                     # not their turn: no-op
+        self.assertEqual(gs.turn_pid, 0)
+        gs.force_skip(0)
+        self.assertEqual(gs.turn_pid, 1)
+        self.assertTrue(any("ran out of time" in ln for ln in gs.log))
+        gs.winner = 0                        # game over: no-op
+        gs.force_skip(1)
+        self.assertEqual(gs.turn_pid, 1)
+
+    def test_end_by_time_most_pieces_wins(self):
+        gs = fresh(2)
+        clear_keep_kings(gs)
+        gs.board[(0, 0)] = Piece("P", 0)     # p0: 2 pieces, p1: 1
+        gs.end_by_time()
+        self.assertEqual(gs.winner, 0)
+        self.assertTrue(any("Time" in ln for ln in gs.log))
+
+    def test_end_by_time_tie_is_draw(self):
+        gs = fresh(2)
+        clear_keep_kings(gs)                 # 1 king each
+        gs.end_by_time()
+        self.assertEqual(gs.winner, -1)
+
+    def test_end_by_time_noop_when_over(self):
+        gs = fresh(2)
+        gs.winner = 1
+        gs.end_by_time()
+        self.assertEqual(gs.winner, 1)
+
+
+class TestQuietStart(unittest.TestCase):
+    """Nobody may capture, shoot, or promote on ply 1, for ANY (shape,
+    player count) at its SHAPE_SIZE — default armies and swapped armies.
+
+    This pins the (layout, shifts, sizes) tuning found by
+    scripts/search_layouts.py; see engine._ARMY_ROWS / engine.SHAPE_SIZE.
+    """
+
+    def test_all_player_counts_start_quiet(self):
+        for n in range(2, 7):
+            assert_quiet(self, fresh(n), "hexagon n=%d" % n)
+
+    def test_every_shape_and_count_starts_quiet(self):
+        for shape, sizes in engine.SHAPE_SIZE.items():
+            for n in sorted(sizes):
+                assert_quiet(self, new_shaped(n, shape),
+                             "%s n=%d" % (shape, n))
+
+    def test_hexagon_6p_every_single_swap_starts_quiet(self):
+        for slot in engine.SWAPPABLE_TYPES:
+            for rep in engine.SWAP_TROOPS:
+                gs = new_shaped(6, "hexagon", swaps={slot: rep})
+                assert_quiet(self, gs, "hexagon 6p swap %s->%s" % (slot, rep))
+
+    def test_sampled_swaps_start_quiet_on_other_shapes(self):
+        samples = (("square", 4), ("triangle", 3), ("octagon", 6),
+                   ("square", 2), ("octagon", 2))
+        picks = ({"CN": "CT"}, {"AR": "GO"}, {"GH": "VA"},
+                 {"DR": "VA"}, {"WZ": "VA"}, {"NE": "CT"}, {"BM": "GO"},
+                 {"CN": "JG"}, {"DR": "JG"}, {"WZ": "JG"},  # v3: 5-tile charge
+                 {"AR": "SN"}, {"NE": "SN"}, {"GH": "WD"}, {"BM": "WD"})
+        for shape, n in samples:
+            for sw in picks:
+                gs = new_shaped(n, shape, swaps=sw)
+                assert_quiet(self, gs, "%s n=%d swap %r" % (shape, n, sw))
+
+
+class TestFuzz(unittest.TestCase):
+    def test_random_playouts_hold_invariants(self):
+        rng = random.Random(1234)
+        for n in (2, 3, 4, 5, 6):
+            for game in range(2):
+                gs = fresh(n)
+                cells = engine.board_cells(gs.radius)
+                for _ply in range(400):
+                    if gs.winner is not None:
+                        break
+                    mover = gs.turn_pid
+                    all_mv = gs.all_legal_moves(mover)
+                    self.assertTrue(all_mv)  # advance_turn guarantees moves
+                    ok, err = gs.apply_move(mover, rng.choice(all_mv))
+                    self.assertTrue(ok, err)
+                    for c, pc in gs.board.items():
+                        self.assertIn(c, cells)
+                        self.assertTrue(gs._is_alive(pc.owner))
+                        self.assertIn(pc.type, engine.PIECE_NAMES)
+                    for types in gs.lost.values():
+                        for t in types:
+                            self.assertIn(t, engine.PIECE_NAMES)
+                    if gs.winner is None:
+                        self.assertTrue(gs._is_alive(gs.turn_pid))
+                    rt = GameState.from_dict(
+                        json.loads(json.dumps(gs.to_dict())))
+                    self.assertEqual(rt.to_dict(), gs.to_dict())
+
+    def test_random_playouts_with_v3_swaps(self):
+        rng = random.Random(97531)
+        swaps = {"CN": "JG", "GH": "WD", "AR": "SN"}
+        for n in (2, 3, 6):
+            gs = GameState.new_game([(i, "P%d" % i) for i in range(n)],
+                                    swaps=swaps)
+            cells = engine.board_cells(gs.radius)
+            for _ply in range(300):
+                if gs.winner is not None:
+                    break
+                mover = gs.turn_pid
+                all_mv = gs.all_legal_moves(mover)
+                self.assertTrue(all_mv)
+                ok, err = gs.apply_move(mover, rng.choice(all_mv))
+                self.assertTrue(ok, err)
+                for c, pc in gs.board.items():
+                    self.assertIn(c, cells)
+                    self.assertTrue(gs._is_alive(pc.owner))
+                    self.assertIn(pc.type, engine.PIECE_NAMES)
+                for types in gs.lost.values():
+                    for t in types:
+                        self.assertIn(t, engine.PIECE_NAMES)
+                if gs.winner is None:
+                    self.assertTrue(gs._is_alive(gs.turn_pid))
+                rt = GameState.from_dict(
+                    json.loads(json.dumps(gs.to_dict())))
+                self.assertEqual(rt.to_dict(), gs.to_dict())
+
+    def test_random_playouts_on_new_shapes(self):
+        rng = random.Random(4321)
+        for shape, n in (("square", 2), ("square", 4),
+                         ("triangle", 3), ("octagon", 6)):
+            gs = new_shaped(n, shape)
+            cells = engine.shape_cells(shape, gs.radius)
+            for _ply in range(250):
+                if gs.winner is not None:
+                    break
+                mover = gs.turn_pid
+                all_mv = gs.all_legal_moves(mover)
+                self.assertTrue(all_mv)
+                ok, err = gs.apply_move(mover, rng.choice(all_mv))
+                self.assertTrue(ok, err)
+                for c, pc in gs.board.items():
+                    self.assertIn(c, cells)
+                    self.assertTrue(gs._is_alive(pc.owner))
+                    self.assertIn(pc.type, engine.PIECE_NAMES)
+                if gs.winner is None:
+                    self.assertTrue(gs._is_alive(gs.turn_pid))
+                rt = GameState.from_dict(
+                    json.loads(json.dumps(gs.to_dict())))
+                self.assertEqual(rt.shape, shape)
+                self.assertEqual(rt.to_dict(), gs.to_dict())
+
+
+if __name__ == "__main__":
+    unittest.main()
