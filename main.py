@@ -90,6 +90,39 @@ set_theme("Classic")
 
 CFG_PATH = Path.home() / ".chess3.json"
 
+VERSION = "4.0.0"
+
+# Per-troop movement animation profiles.
+#   dur: seconds  |  ease: out / in_expo (accelerate) / steps (fast increments)
+#   arc: parabolic lift (jump/fly)  |  slam: impact ring+shake+sound at landing
+#   fx flags: spin wind, smoke+crack_path, crack_land, phase+lightning,
+#             afterimages, alpha (ghost), trail (skeleton), fire_on_capture
+ANIM_PROFILES = {
+    "K":  dict(dur=0.24, ease="out"),
+    "Q":  dict(dur=0.32, ease="steps"),
+    "R":  dict(dur=0.15, ease="out"),
+    "B":  dict(dur=0.10, ease="out"),
+    "N":  dict(dur=0.26, ease="out", arc=0.55),
+    "P":  dict(dur=0.45, ease="out"),
+    "CN": dict(dur=0.50, ease="out"),
+    "AR": dict(dur=0.10, ease="out"),
+    "WZ": dict(dur=0.38, phase=True, crack_land=True, snd="lightning"),
+    "DR": dict(dur=0.46, ease="out", arc=1.25, slam=True,
+               fire_on_capture=True, crack_capture=True),
+    "CH": dict(dur=0.11, ease="out", afterimages=True, slam=True, snd="whoosh"),
+    "BM": dict(dur=0.24, ease="out"),
+    "GH": dict(dur=0.26, ease="out", alpha=110),
+    "NE": dict(dur=0.24, ease="out"),
+    "CT": dict(dur=0.52, ease="out", arc=1.45, slam=True, crack_land=True),
+    "VA": dict(dur=0.30, ease="out", spin=True, snd="whoosh"),
+    "GO": dict(dur=0.55, ease="out", snd="grind"),
+    "JG": dict(dur=0.42, ease="in_expo", smoke=True, crack_path=True,
+               slam=True),
+    "SN": dict(dur=0.10, ease="out"),
+    "WD": dict(dur=0.24, ease="out"),
+    "SK": dict(dur=0.50, ease="out", trail=True),
+}
+
 SHAPE_CYCLE = ["hexagon", "square", "triangle", "octagon"]
 MOVE_TIMER_OPTS = [0, 15, 30, 60, 120]
 TOTAL_TIMER_OPTS = [0, 5, 10, 20, 30]
@@ -286,6 +319,10 @@ class BoardView:
         self.cells = set()
         self.last_deaths = 0        # pieces that died in the latest update
         self.last_kind = None
+        self.cracked = set()        # permanently cracked tiles (cosmetic)
+        self.particles = []         # transient effect particles
+        self.projectile = None      # arrow / cannonball in flight
+        self.shake_t0 = 0.0         # board shake on slams/explosions
         self._t2d = {}           # true cell -> display cell (orientation)
         self._d2t = {}
 
@@ -353,6 +390,24 @@ class BoardView:
         except Exception:
             pass
 
+    @staticmethod
+    def _line_cells(frm, to):
+        """Cells strictly between frm and to along a straight hex ray
+        (works for ortho rays; empty list otherwise)."""
+        dq, dr = to[0] - frm[0], to[1] - frm[1]
+        n = engine.hex_dist(frm, to)
+        if n <= 1:
+            return []
+        if dq % n or dr % n:
+            return []
+        sq, sr = dq // n, dr // n
+        return [(frm[0] + sq * i, frm[1] + sr * i) for i in range(1, n)]
+
+    def _spawn(self, kind, cell, **extra):
+        p = {"kind": kind, "cell": cell, "t0": time.time()}
+        p.update(extra)
+        self.particles.append(p)
+
     def _animate_diff(self, old, last, now):
         mv = last.get("move") or {}
         kind = mv.get("kind")
@@ -360,27 +415,83 @@ class BoardView:
         to = tuple(mv.get("to", (0, 0)))
         pid = last.get("pid", 0)
         color = icons.PLAYER_COLORS[self._color_of(pid)]
-        if kind == "move":
-            pc = self.state.board.get(to)
-            if pc is not None:
-                self.anim = {"type": pc.type, "color": color, "frm": frm, "to": to,
-                             "t0": now, "dur": 0.14}
-        elif kind == "shoot":
-            self.beam = {"frm": frm, "to": to, "t0": now}
-        # death flashes: cells that had a piece and are now empty (not the mover origin)
+
+        mover = self.state.board.get(to)
+        mover_type = mover.type if (kind == "move" and mover) else None
+        old_target = old.board.get(to)
+        captured = (kind == "move" and old_target is not None
+                    and old_target.owner != pid)
+
+        # death bookkeeping (flashes + counters for sounds)
         deaths = 0
+        boomed_bombers = []
         for cell, pc in old.board.items():
             if cell != frm and cell not in self.state.board:
                 self.flashes.append((cell, now))
                 deaths += 1
-        # also flash cells where the owner changed (captures)
+                if pc.type == "BM":
+                    boomed_bombers.append(cell)
         for cell, pc in self.state.board.items():
             oldpc = old.board.get(cell)
             if oldpc is not None and oldpc.owner != pc.owner and cell != to:
                 self.flashes.append((cell, now))
                 deaths += 1
+        # a bomber that vanished at the mover's destination exploded there
+        if (kind == "move" and old_target is not None
+                and old_target.type == "BM" and to not in boomed_bombers):
+            boomed_bombers.append(to)
+        # the mover itself may have blown up on arrival (fuse / capture)
+        if (kind == "move" and mover is None and frm in old.board
+                and old.board[frm].type == "BM"):
+            boomed_bombers.append(to)
+            mover_type = "BM"
         self.last_deaths = deaths
         self.last_kind = kind
+
+        prof = ANIM_PROFILES.get(mover_type or "", {})
+        if kind == "move" and mover_type is not None:
+            self.anim = {"type": mover_type, "color": color, "frm": frm,
+                         "to": to, "t0": now, "dur": prof.get("dur", 0.2),
+                         "prof": prof, "captured": captured}
+            # ---- permanent cracks + impact effects per profile ----
+            if prof.get("crack_path"):
+                for c in self._line_cells(frm, to) + [to]:
+                    self.cracked.add(c)
+            if prof.get("crack_land"):
+                self.cracked.add(to)
+            if prof.get("crack_capture") and captured:
+                self.cracked.add(to)
+            if prof.get("phase"):
+                self._spawn("bolt", to, delay=prof["dur"] * 0.55)
+            if prof.get("slam"):
+                self.shake_t0 = now + prof.get("dur", 0.2)
+            if prof.get("fire_on_capture") and captured:
+                self._spawn("fire", to, delay=prof.get("dur", 0.3))
+            if prof.get("smoke"):
+                self._spawn("smoketrail", frm, to=to, dur=prof.get("dur", 0.4))
+            if mover_type == "CN" and captured:
+                self.projectile = {"kind": "cannonball", "frm": frm, "to": to,
+                                   "t0": now, "dur": 0.28}
+                self.cracked.add(to)
+        elif kind == "shoot":
+            shooter = old.board.get(frm) or self.state.board.get(frm)
+            arrow_like = shooter is not None and shooter.type in ("AR", "SN")
+            self.projectile = {"kind": "arrow" if arrow_like else "cannonball",
+                               "frm": frm, "to": to, "t0": now, "dur": 0.15}
+            if shooter is not None and shooter.type == "CT":
+                self.cracked.add(to)
+                self.shake_t0 = now + 0.15
+        elif kind == "raise":
+            self._spawn("spawnglow", to)
+        elif kind == "grave":
+            self._spawn("spawnglow", to, dark=True)
+        # every bomber explosion permanently cracks its surroundings
+        for bc in boomed_bombers:
+            self.cracked.add(bc)
+            for d in engine.ORTHO:
+                self.cracked.add((bc[0] + d[0], bc[1] + d[1]))
+            self.shake_t0 = now
+        self.cracked &= self.cells
 
     def _color_of(self, pid):
         for p in (self.state.players if self.state else []):
@@ -457,6 +568,180 @@ class BoardView:
                         center[1] + self.s * scale * math.sin(a)))
         return pts
 
+    # ---- animation renderers ----
+
+    def _draw_mover(self, surf, now):
+        a = self.anim
+        prof = a.get("prof", {})
+        raw = min(1.0, (now - a["t0"]) / a["dur"])
+        ease = prof.get("ease", "out")
+        if ease == "in_expo":
+            t = raw ** 3
+        elif ease == "steps":
+            n = max(1, engine.hex_dist(a["frm"], a["to"]))
+            seg, frac = divmod(raw * n, 1.0)
+            t = min(1.0, (seg + min(1.0, frac * 3)) / n)
+        else:
+            t = 1 - (1 - raw) ** 2
+        fx, fy = self.cell_to_px(a["frm"])
+        tx, ty = self.cell_to_px(a["to"])
+        x, y = fx + (tx - fx) * t, fy + (ty - fy) * t
+        size = int(self.s * 1.15)
+
+        lift = prof.get("arc")
+        if lift:
+            y -= math.sin(math.pi * raw) * lift * self.s
+            size = int(size * (1 + 0.25 * math.sin(math.pi * raw)))
+
+        if prof.get("smoke") and raw < 1:
+            self._spawn("smoke", None, px=x, py=y)
+        if prof.get("trail") and raw < 1:
+            self._spawn("inktrail", None, px=x, py=y)
+        if prof.get("afterimages"):
+            for back, alp in ((0.35, 70), (0.18, 130)):
+                bt = max(0.0, t - back)
+                bx, by = fx + (tx - fx) * bt, fy + (ty - fy) * bt
+                ghost = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
+                icons.draw_piece(ghost, a["type"], a["color"], size, (size, size))
+                ghost.set_alpha(alp)
+                surf.blit(ghost, (bx - size, by - size))
+
+        alpha = prof.get("alpha")
+        if prof.get("phase"):
+            # wizard: fade out at origin, vanish, fade in at destination
+            if raw < 0.4:
+                x, y, alpha = fx, fy, int(255 * (1 - raw / 0.4))
+            elif raw < 0.6:
+                return
+            else:
+                x, y, alpha = tx, ty, int(255 * (raw - 0.6) / 0.4)
+
+        if alpha is not None:
+            ghost = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
+            icons.draw_piece(ghost, a["type"], a["color"], size, (size, size))
+            ghost.set_alpha(alpha)
+            surf.blit(ghost, (x - size, y - size))
+        else:
+            icons.draw_piece(surf, a["type"], a["color"], size, (int(x), int(y)))
+
+        if prof.get("spin"):
+            # whirling wind arcs around the valkyrie
+            for k in range(3):
+                ang = now * 9 + k * 2.1
+                r = self.s * (0.75 + 0.15 * math.sin(now * 5 + k))
+                ax, ay = x + math.cos(ang) * r, y + math.sin(ang) * r * 0.6
+                pygame.draw.arc(surf, (225, 235, 245),
+                                pygame.Rect(ax - 9, ay - 5, 18, 10),
+                                ang, ang + 2.2, 2)
+
+    def _draw_projectile(self, surf, now):
+        pr = self.projectile
+        if pr is None:
+            return
+        t = (now - pr["t0"]) / pr["dur"]
+        if t >= 1:
+            self.projectile = None
+            return
+        fx, fy = self.cell_to_px(pr["frm"])
+        tx, ty = self.cell_to_px(pr["to"])
+        x, y = fx + (tx - fx) * t, fy + (ty - fy) * t
+        if pr["kind"] == "arrow":
+            ang = math.atan2(ty - fy, tx - fx)
+            ln = self.s * 0.7
+            hx, hy = x + math.cos(ang) * ln / 2, y + math.sin(ang) * ln / 2
+            pygame.draw.line(surf, (235, 220, 170),
+                             (x - math.cos(ang) * ln / 2,
+                              y - math.sin(ang) * ln / 2), (hx, hy), 3)
+            side = 0.35 * self.s
+            pygame.draw.polygon(surf, (235, 220, 170), [
+                (hx + math.cos(ang) * side * 0.6, hy + math.sin(ang) * side * 0.6),
+                (hx + math.cos(ang + 2.5) * side * 0.35, hy + math.sin(ang + 2.5) * side * 0.35),
+                (hx + math.cos(ang - 2.5) * side * 0.35, hy + math.sin(ang - 2.5) * side * 0.35)])
+        else:  # cannonball with a small lob
+            y -= math.sin(math.pi * t) * self.s * 0.9
+            pygame.draw.circle(surf, (30, 30, 34), (int(x), int(y)),
+                               max(3, int(self.s * 0.22)))
+            pygame.draw.circle(surf, (90, 90, 100), (int(x), int(y)),
+                               max(3, int(self.s * 0.22)), 1)
+
+    def _draw_particles(self, surf, now):
+        keep = []
+        for p in self.particles:
+            age = now - p["t0"] - p.get("delay", 0)
+            if age < 0:
+                keep.append(p)
+                continue
+            kind = p["kind"]
+            if kind in ("smoke", "inktrail"):
+                dur = 0.7
+                if age < dur:
+                    keep.append(p)
+                    k = age / dur
+                    r = max(2, int(self.s * (0.18 + 0.25 * k)))
+                    col = ((120, 120, 124) if kind == "smoke" else (25, 25, 30))
+                    fade = tuple(int(c + (BG[i] - c) * k) for i, c in enumerate(col))
+                    pygame.draw.circle(surf, fade,
+                                       (int(p["px"]), int(p["py"] - age * 14)), r)
+            elif kind == "smoketrail":
+                dur = p.get("dur", 0.4)
+                if age < dur:
+                    keep.append(p)
+                    fx, fy = self.cell_to_px(p["cell"])
+                    tx, ty = self.cell_to_px(p["to"])
+                    k = (age / dur) ** 3
+                    self._spawn("smoke", None, px=fx + (tx - fx) * k,
+                                py=fy + (ty - fy) * k)
+            elif kind == "bolt":
+                dur = 0.35
+                if age < dur:
+                    keep.append(p)
+                    cx, cy = self.cell_to_px(p["cell"])
+                    top = cy - self.s * 6
+                    pts = [(cx, top)]
+                    seg = 6
+                    rng = (hash(p["cell"]) & 0xffff) or 1
+                    for i in range(1, seg):
+                        yy = top + (cy - top) * i / seg
+                        xx = cx + math.sin(rng * i * 12.9898) * self.s * 0.5
+                        pts.append((xx, yy))
+                    pts.append((cx, cy))
+                    w = 4 if age < 0.12 else 2
+                    pygame.draw.lines(surf, (255, 255, 210), False, pts, w)
+                    if age < 0.12:
+                        pygame.draw.circle(surf, (255, 255, 230),
+                                           (int(cx), int(cy)), int(self.s * 0.7), 2)
+            elif kind == "fire":
+                dur = 0.65
+                if age < dur:
+                    keep.append(p)
+                    cx, cy = self.cell_to_px(p["cell"])
+                    rng = abs(hash(p["cell"])) % 997
+                    for i in range(14):
+                        a = (rng + i * 61) % 360
+                        spd = 0.5 + ((rng + i * 7) % 50) / 60
+                        d = age * spd * self.s * 2.2
+                        px = cx + math.cos(math.radians(a)) * d
+                        py = cy + math.sin(math.radians(a)) * d * 0.6 - age * 26
+                        k = age / dur
+                        col = (255, int(200 * (1 - k)) + 30, 30)
+                        pygame.draw.circle(surf, col, (int(px), int(py)),
+                                           max(1, int(self.s * 0.16 * (1 - k))))
+            elif kind == "spawnglow":
+                dur = 0.9
+                if age < dur:
+                    keep.append(p)
+                    cx, cy = self.cell_to_px(p["cell"])
+                    k = age / dur
+                    col = ((160, 90, 220) if p.get("dark")
+                           else (90, 230, 120))
+                    for ring in range(3):
+                        rk = (k + ring * 0.2) % 1.0
+                        pygame.draw.circle(
+                            surf, tuple(int(c * (1 - rk)) for c in col),
+                            (int(cx), int(cy)),
+                            max(2, int(self.s * (0.2 + rk * 0.9))), 2)
+        self.particles = keep[-160:]
+
     # ---- interaction ----
 
     def my_turn(self):
@@ -492,8 +777,25 @@ class BoardView:
         mouse = pygame.mouse.get_pos()
         self.hover = self.px_to_cell(mouse)
 
+        # impact shake: brief decaying jitter after slams/explosions
+        base_origin = self.origin
+        shake_age = now - self.shake_t0
+        if 0 <= shake_age < 0.3:
+            k = (1 - shake_age / 0.3) * self.s * 0.18
+            self.origin = (base_origin[0] + math.sin(now * 71) * k,
+                           base_origin[1] + math.cos(now * 63) * k)
+
+        graveyards = getattr(gs, "graveyards", None) or set()
         for cell in self.cells:
             cx, cy = self.cell_to_px(cell)
+            if cell in graveyards:
+                pts = self.hex_points((cx, cy), 0.985)
+                pygame.draw.polygon(surf, (16, 14, 18), pts)
+                pygame.draw.polygon(surf, (60, 52, 66), pts, 2)
+                if hasattr(icons, "draw_tombstone"):
+                    icons.draw_tombstone(surf, (int(cx), int(cy)),
+                                         int(self.s * 1.6))
+                continue
             shade = CELL_SHADES[(cell[0] - cell[1]) % 3]
             if cell in self.my_edge_cells:
                 mycol = icons.PLAYER_COLORS[self._color_of(self.my_pid)]
@@ -506,6 +808,8 @@ class BoardView:
                               for s, t in zip(shade, DANGER_TINT))
             pts = self.hex_points((cx, cy), 0.985)
             pygame.draw.polygon(surf, shade, pts)
+            if cell in self.cracked and hasattr(icons, "draw_cracks"):
+                icons.draw_cracks(surf, cell, (int(cx), int(cy)), int(self.s))
             if cell in self.danger_cells:
                 pygame.draw.polygon(surf, (255, 90, 90),
                                     self.hex_points((cx, cy), 0.9), 2)
@@ -538,8 +842,7 @@ class BoardView:
         # pieces
         anim_target = None
         if self.anim is not None:
-            t = (now - self.anim["t0"]) / self.anim["dur"]
-            if t >= 1:
+            if (now - self.anim["t0"]) / self.anim["dur"] >= 1:
                 self.anim = None
             else:
                 anim_target = self.anim["to"]
@@ -549,14 +852,18 @@ class BoardView:
             cx, cy = self.cell_to_px(cell)
             col = icons.PLAYER_COLORS[self._color_of(pc.owner)]
             icons.draw_piece(surf, pc.type, col, int(self.s * 1.15), (int(cx), int(cy)))
+            if pc.type == "SK":
+                # skeleton lifespan pips (3 moves then it crumbles)
+                left = max(0, 3 - getattr(pc, "uses", 0))
+                for i in range(left):
+                    pygame.draw.circle(surf, (140, 240, 150),
+                                       (int(cx - self.s * 0.3 + i * self.s * 0.3),
+                                        int(cy + self.s * 0.62)), max(2, int(self.s * 0.07)))
         if self.anim is not None:
-            t = min(1.0, (now - self.anim["t0"]) / self.anim["dur"])
-            t = 1 - (1 - t) ** 2
-            fx, fy = self.cell_to_px(self.anim["frm"])
-            tx, ty = self.cell_to_px(self.anim["to"])
-            x, y = fx + (tx - fx) * t, fy + (ty - fy) * t
-            icons.draw_piece(surf, self.anim["type"], self.anim["color"],
-                             int(self.s * 1.15), (int(x), int(y)))
+            self._draw_mover(surf, now)
+
+        self._draw_projectile(surf, now)
+        self._draw_particles(surf, now)
 
         # archer beam
         if self.beam is not None:
@@ -580,6 +887,8 @@ class BoardView:
                 col = (255, int(180 * (1 - t)) + 60, 60)
                 pygame.draw.circle(surf, col, (int(cx), int(cy)), int(alpha_r), 3)
         self.flashes = keep
+        # restore un-shaken origin so hit-testing stays stable
+        self.origin = base_origin
 
 
 class App:
@@ -627,6 +936,9 @@ class App:
             self.presence = None
         if self.cfg.get("fullscreen"):
             self._apply_fullscreen(True, save=False)
+        self.update_info = None       # newer release found on GitHub
+        self.update_status = ""       # "" | downloading text
+        self._check_updates()
         self.server = None
         self.client = None
         self.board = BoardView()
@@ -798,6 +1110,104 @@ class App:
                 draw_text(self.win, label, (cx - 230, btn.rect.y + 12), 16,
                           TEXT, bold=True)
             btn.draw(self.win, mouse)
+
+    # ---------- auto-update ----------
+
+    @staticmethod
+    def _ver_tuple(tag):
+        try:
+            return tuple(int(x) for x in str(tag).lstrip("vV").split("."))
+        except Exception:
+            return (0,)
+
+    def _check_updates(self):
+        """On startup: if GitHub has a newer release, offer to update.
+        Only meaningful for the frozen exe (source installs use git)."""
+        import sys
+        if not getattr(sys, "frozen", False):
+            return
+        if not hasattr(net, "get_latest_release"):
+            return
+
+        def _chk():
+            rel = net.get_latest_release()
+            if rel and self._ver_tuple(rel["tag"]) > self._ver_tuple(VERSION):
+                self.update_info = rel
+                sounds.play("invite")
+        threading.Thread(target=_chk, daemon=True).start()
+
+    def _update_buttons(self):
+        W, H = self.win.get_size()
+        cx = W // 2
+        return [
+            ("yes", Button("UPDATE & RESTART", (cx - 170, H // 2 + 26, 340, 46),
+                           color=GOOD, enabled=not self.update_status)),
+            ("no", Button("LATER", (cx - 80, H // 2 + 82, 160, 38),
+                          color=(120, 126, 140), enabled=not self.update_status)),
+        ]
+
+    def draw_update_prompt(self, mouse):
+        W, H = self.win.get_size()
+        veil = pygame.Surface((W, H), pygame.SRCALPHA)
+        veil.fill((8, 9, 12, 190))
+        self.win.blit(veil, (0, 0))
+        cx = W // 2
+        self.panel((cx - 240, H // 2 - 120, 480, 250))
+        icons.draw_piece(self.win, "DR", (214, 74, 74), 46, (cx, H // 2 - 88))
+        draw_text(self.win, "UPDATE AVAILABLE", (cx, H // 2 - 52), 26, TEXT,
+                  bold=True, center=True)
+        tag = (self.update_info or {}).get("tag", "?")
+        draw_text(self.win, "Chess 3 %s is out (you have v%s)" % (tag, VERSION),
+                  (cx, H // 2 - 18), 17, TEXT_DIM, center=True)
+        if self.update_status:
+            draw_text(self.win, self.update_status, (cx, H // 2 + 8), 17,
+                      ACCENT, center=True)
+        for _key, b in self._update_buttons():
+            b.draw(self.win, mouse)
+
+    def handle_update_click(self, pos):
+        for key, b in self._update_buttons():
+            if b.hit(pos):
+                if key == "no":
+                    self.update_info = None
+                else:
+                    self._do_update()
+                return True
+        return True   # modal: swallow all clicks
+
+    def _do_update(self):
+        import subprocess
+        import sys
+        rel = self.update_info
+        if not rel:
+            return
+        exe = Path(sys.executable)
+        new_exe = exe.with_name("Chess3_new.exe")
+        self.update_status = "Downloading update..."
+
+        def _dl():
+            ok = net.download_file(rel["url"], str(new_exe))
+            if not ok:
+                self.update_status = ""
+                self.update_info = None
+                self.toast("Update download failed — try again later", BAD)
+                return
+            bat = exe.with_name("chess3_update.bat")
+            pid = os.getpid()
+            bat.write_text(
+                "@echo off\r\n"
+                ":wait\r\n"
+                "tasklist /fi \"PID eq %d\" 2>nul | find \"%d\" >nul && "
+                "(timeout /t 1 /nobreak >nul & goto wait)\r\n"
+                "move /y \"%s\" \"%s\"\r\n"
+                "start \"\" \"%s\"\r\n"
+                "del \"%%~f0\"\r\n" % (pid, pid, new_exe, exe, exe),
+                encoding="ascii")
+            subprocess.Popen(["cmd", "/c", str(bat)],
+                             creationflags=0x08000000, cwd=str(exe.parent))
+            self.update_status = "Restarting..."
+            pygame.event.post(pygame.event.Event(pygame.QUIT))
+        threading.Thread(target=_dl, daemon=True).start()
 
     # ---------- friends & recent players ----------
 
@@ -1054,13 +1464,31 @@ class App:
         lines — plus the your-turn chime on turn handoff."""
         deaths = self.board.last_deaths
         kind = self.board.last_kind
-        if sd.get("winner") is None and (deaths or kind == "shoot"):
+        anim = self.board.anim
+        prof = (anim or {}).get("prof", {})
+        captured = (anim or {}).get("captured", False)
+        if sd.get("winner") is None:
             if deaths >= 3:
                 sounds.play("boom")     # explosion (or a huge chain trade)
             elif kind == "shoot":
-                sounds.play("shoot")
-            elif deaths:
-                sounds.play("capture")
+                pr = self.board.projectile or {}
+                sounds.play("cannon" if pr.get("kind") == "cannonball"
+                            else "shoot")
+            elif kind == "raise":
+                sounds.play("rattle")   # skeleton claws out of the ground
+            elif kind == "grave":
+                sounds.play("lose")     # an eerie curse settles
+            elif kind == "move":
+                if captured and prof.get("fire_on_capture"):
+                    sounds.play("fire")
+                elif captured and self.board.projectile:
+                    sounds.play("cannon")
+                elif prof.get("snd"):
+                    sounds.play(prof["snd"])
+                elif prof.get("slam"):
+                    sounds.play("slam")
+                elif deaths:
+                    sounds.play("capture")
         mine = (sd.get("turn_pid") == self.my_pid()
                 and sd.get("winner") is None)
         if mine and not self._prev_turn_mine:
@@ -1076,6 +1504,32 @@ class App:
         if not self.game_clock or self.game_clock.get(key) is None:
             return None
         return max(0, self.game_clock[key] - int(time.time() - self.game_clock_at))
+
+    def _my_graves_left(self):
+        gs = self.board.state
+        if gs is None or gs.winner is not None:
+            return 0
+        me = next((p for p in gs.players if p["pid"] == self.board.my_pid), None)
+        if me is None or me["alive"]:
+            return 0
+        gl = getattr(gs, "graves_left", None) or {}
+        return gl.get(self.board.my_pid, 0)
+
+    def _try_place_grave(self, pos):
+        """Eliminated players may curse ONE empty tile into a graveyard."""
+        if self._my_graves_left() <= 0:
+            return False
+        gs = self.board.state
+        cell = self.board.px_to_cell(pos)
+        if (cell is None or cell in gs.board
+                or cell in (getattr(gs, "graveyards", None) or set())):
+            return False
+        payload = [cell[0], cell[1]]
+        if self.server is not None:
+            self.server.submit_host_grave(payload)
+        elif self.client is not None and hasattr(self.client, "send_grave"):
+            self.client.send_grave(payload)
+        return True
 
     def submit_move(self, mv):
         md = mv.to_dict()
@@ -1155,6 +1609,8 @@ class App:
                 self.draw_game(mouse, now)
             if self.help_open:
                 self.draw_help(mouse)
+            if self.update_info is not None and self.screen == "MENU":
+                self.draw_update_prompt(mouse)
             self.draw_invites(mouse, now)
             self.draw_toasts(now)
             pygame.display.flip()
@@ -1174,6 +1630,10 @@ class App:
         pygame.quit()
 
     def dispatch_event(self, ev):
+        if (self.update_info is not None and self.screen == "MENU"
+                and ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1):
+            self.handle_update_click(ev.pos)
+            return
         if (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1
                 and self.invites and self.handle_invite_click(ev.pos)):
             return
@@ -1242,6 +1702,8 @@ class App:
                 # zoomed cells can extend under the HUD panels — only clicks
                 # inside the board area may reach the board
                 if not self.board.area.collidepoint(ev.pos):
+                    return
+                if self._try_place_grave(ev.pos):
                     return
                 mv = self.board.click(ev.pos)
                 if mv is not None:
@@ -1729,9 +2191,15 @@ class App:
         if me and not me["alive"] and gs.winner is None:
             pulse = 0.6 + 0.4 * math.sin(now * 2)
             col = tuple(int(c * pulse) for c in BAD)
-            draw_text(self.win, "YOU'RE OUT — spectating the battle",
-                      ((W - side_w) // 2, top_h + 12), 24, col, bold=True,
-                      center=True)
+            if self._my_graves_left() > 0:
+                draw_text(self.win,
+                          "YOU'RE OUT — click any empty tile to CURSE it into a graveyard",
+                          ((W - side_w) // 2, top_h + 12), 22, col, bold=True,
+                          center=True)
+            else:
+                draw_text(self.win, "YOU'RE OUT — spectating the battle",
+                          ((W - side_w) // 2, top_h + 12), 24, col, bold=True,
+                          center=True)
 
         # turn banner
         if gs.winner is None:
@@ -1820,9 +2288,21 @@ class App:
     # ---------- overlays ----------
 
     HELP_TYPES = ["K", "Q", "R", "B", "N", "P", "CN", "AR", "WZ", "DR", "CH",
-                  "BM", "GH", "NE", "CT", "VA", "GO"]
+                  "BM", "GH", "NE", "SK", "CT", "VA", "GO", "JG", "SN", "WD"]
     CLASSIC_TYPES = ("K", "Q", "R", "B", "N", "P")
-    SWAPPABLE_TYPES = ("CT", "VA", "GO")
+    SWAPPABLE_TYPES = ("CT", "VA", "GO", "JG", "SN", "WD")
+
+    def _help_visible_types(self):
+        """In a match: only the troops actually in THIS game (skeletons count
+        while a Necromancer lives). Outside: the whole catalog."""
+        types = [t for t in self.HELP_TYPES if t in engine.PIECE_NAMES]
+        gs = self.board.state
+        if self.screen == "GAME" and gs is not None:
+            present = {pc.type for pc in gs.board.values()}
+            if "NE" in present:
+                present.add("SK")
+            types = [t for t in types if t in present]
+        return types
 
     def draw_help(self, mouse):
         W, H = self.win.get_size()
@@ -1833,7 +2313,7 @@ class App:
         draw_text(self.win, "capture a King to knock that player out — last one standing wins    "
                   "(scroll with the mouse wheel, ESC to close)",
                   (W // 2, 66), 15, TEXT_DIM, center=True)
-        types = [t for t in self.HELP_TYPES if t in engine.PIECE_NAMES]
+        types = self._help_visible_types()
         cols = 2 if W < 1750 else 3
         entry_w = (W - 100) // cols
         entry_h = 168

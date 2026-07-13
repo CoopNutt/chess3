@@ -14,9 +14,16 @@ v3: PresenceService — LAN/VPN peer discovery over UDP broadcast beacons on
 PRESENCE_PORT plus Steam-style invites carrying the lobby code; protocol
 version bumped to 3 (new piece types cross the wire; old clients kicked with
 the same message as before).
+
+v4: dead players curse tiles — a {"t":"grave","cell":[q,r]} message feeds
+engine.apply_grave (HostServer.submit_host_grave for the host,
+NetClient.send_grave for joiners); GitHub release-check helpers
+(get_latest_release / download_file) for the in-app updater; protocol
+version bumped to 4 (Skeletons + graveyards cross the wire).
 """
 import json
 import math
+import os
 import queue
 import random
 import re
@@ -30,7 +37,7 @@ from urllib.parse import urljoin
 import engine
 
 DEFAULT_PORT = 47733
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_PLAYERS = 6
 MIN_PLAYERS = 2
 _MAX_LINE = 64 * 1024
@@ -292,6 +299,106 @@ def upnp_unmap_port(port, timeout=3.0):
 
 
 # ---------------------------------------------------------------------------
+# Release check (v4) — best effort, exception-proof
+# ---------------------------------------------------------------------------
+
+GITHUB_REPO = "CoopNutt/chess3"
+# Base URL split out so tests can point it at an unroutable localhost server
+# (tests must NEVER hit real GitHub).
+GITHUB_API = "https://api.github.com"
+_HTTP_HEADERS = {"User-Agent": "Chess3-Updater",   # GitHub requires a UA
+                 "Accept": "application/vnd.github+json"}
+
+
+def _close_quietly(exc):
+    """HTTPError carries an open response object; close it so swallowing
+    the exception does not leak the socket (ResourceWarning)."""
+    try:
+        close = getattr(exc, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+def get_latest_release(timeout=4.0):
+    """Latest GitHub release as {"tag", "url", "notes"}, or None.
+
+    `url` is the browser_download_url of the first .exe asset. Returns None
+    on ANY failure: no network, rate limit, no release yet, no exe asset,
+    malformed response. Never raises.
+    """
+    try:
+        api = "%s/repos/%s/releases/latest" % (GITHUB_API, GITHUB_REPO)
+        req = urllib.request.Request(api, headers=dict(_HTTP_HEADERS))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read(1024 * 1024).decode("utf-8", "replace"))
+        if not isinstance(data, dict):
+            return None
+        tag = data.get("tag_name")
+        if not isinstance(tag, str) or not tag:
+            return None
+        url = None
+        assets = data.get("assets")
+        for asset in (assets if isinstance(assets, list) else []):
+            if not isinstance(asset, dict):
+                continue
+            name = asset.get("name")
+            dl = asset.get("browser_download_url")
+            if (isinstance(name, str) and name.lower().endswith(".exe")
+                    and isinstance(dl, str) and dl):
+                url = dl
+                break
+        if url is None:
+            return None
+        notes = data.get("body")
+        return {"tag": tag, "url": url,
+                "notes": notes if isinstance(notes, str) else ""}
+    except Exception as e:
+        _close_quietly(e)
+        return None
+
+
+def download_file(url, dest_path, timeout=30.0):
+    """Stream `url` to `dest_path` in chunks. True on success.
+
+    On ANY failure returns False and removes the partial file — including a
+    connection dropped mid-download: chunked HTTPResponse.read() reports a
+    premature EOF as a plain end-of-stream, so the byte count is checked
+    against Content-Length explicitly. Never raises.
+    """
+    opened = False
+    try:
+        req = urllib.request.Request(url, headers=dict(_HTTP_HEADERS))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            try:
+                expected = int(r.headers.get("Content-Length"))
+            except (AttributeError, TypeError, ValueError):
+                expected = None
+            with open(dest_path, "wb") as f:
+                opened = True
+                written = 0
+                while True:
+                    chunk = r.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    written += len(chunk)
+        if expected is not None and written != expected:
+            raise OSError("truncated download (%d of %d bytes)"
+                          % (written, expected))
+        return True
+    except Exception as e:
+        _close_quietly(e)
+        if opened:   # never delete a pre-existing file we didn't touch
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Wire helpers
 # ---------------------------------------------------------------------------
 
@@ -523,6 +630,10 @@ class HostServer:
     def submit_host_move(self, move_dict):
         self._handle_move(0, move_dict)
 
+    def submit_host_grave(self, cell):
+        """The (dead) host curses a tile; result arrives on `events`."""
+        self._handle_grave(0, cell)
+
     # -- internals --
 
     def _accept_loop(self):
@@ -583,6 +694,8 @@ class HostServer:
                 t = msg.get("t")
                 if t == "move":
                     self._handle_move(pid, msg.get("move"))
+                elif t == "grave":
+                    self._handle_grave(pid, msg.get("cell"))
                 elif t == "leave":
                     break
         except (ValueError, OSError, json.JSONDecodeError):
@@ -629,6 +742,50 @@ class HostServer:
                             "clock": clock})
                 if gameover:
                     self._emit(gameover)
+        if reject is not None:
+            self._send_error(pid, reject)
+
+    def _handle_grave(self, pid, cell):
+        """A dead player curses one tile (v4). Same locking discipline as
+        _handle_move: mutate under _lock, emit under _out_lock only, send
+        errors outside both. A grave never ends the game (nobody dies), so
+        there is no gameover leg. Malformed `cell` payloads are rejected,
+        never raised."""
+        reject = None
+        state = last = clock = None
+        with self._out_lock:
+            with self._lock:
+                if self._phase != "game" or self._gs is None:
+                    reject = "Game has not started"
+                else:
+                    c = None
+                    if isinstance(cell, (list, tuple)) and len(cell) == 2:
+                        try:
+                            c = (int(cell[0]), int(cell[1]))
+                        except (TypeError, ValueError):
+                            c = None
+                    if c is None:
+                        reject = "Malformed cell"
+                    else:
+                        ok, err = self._gs.apply_grave(pid, c)
+                        if not ok:
+                            reject = err or "Cannot curse that tile"
+                        else:
+                            # a curse can strand the player to move with zero
+                            # legal moves — skip them so the game can't stall
+                            gs = self._gs
+                            if (gs.winner is None
+                                    and not gs.all_legal_moves(gs.turn_pid)):
+                                gs.force_skip(gs.turn_pid)
+                            state = gs.to_dict()
+                            clock = self._clock()
+                            last = {"pid": pid,
+                                    "move": {"from": [c[0], c[1]],
+                                             "to": [c[0], c[1]],
+                                             "kind": "grave"}}
+            if reject is None:
+                self._emit({"t": "state", "state": state, "last_move": last,
+                            "clock": clock})
         if reject is not None:
             self._send_error(pid, reject)
 
@@ -843,6 +1000,18 @@ class NetClient:
     def send_move(self, move_dict):
         try:
             _send_line(self._sock, {"t": "move", "move": move_dict},
+                       self._send_lock)
+        except OSError:
+            pass
+
+    def send_grave(self, cell):
+        """Curse a tile (dead players only, v4): cell = (q, r).
+
+        Sent as-is; the server validates and answers with state or error.
+        """
+        cell = list(cell) if isinstance(cell, tuple) else cell
+        try:
+            _send_line(self._sock, {"t": "grave", "cell": cell},
                        self._send_lock)
         except OSError:
             pass

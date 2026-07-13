@@ -647,3 +647,93 @@ per-theme piece finishes, FRIENDS screen gains ONLINE (LAN) section with
 INVITE buttons while hosting, Steam-style invite toast bottom-right with
 ACCEPT/X (auto-join via stored name), presence service runs for the app's
 lifetime.
+
+---
+
+# V4 ADDENDUM
+
+## V4.1 Skeletons, bomber fuse, graveyards (engine.py)
+
+- **Piece.uses**: new int field (default 0), counts completed moves for pieces
+  that care. Serialization: board rows become [q, r, type, owner, moved, uses]
+  — from_dict MUST accept old 5-element rows (uses=0).
+- **SK Skeleton** (new type, NOT in armies/swaps): spawned only by the
+  Necromancer. Moves/captures exactly like a PAWN of its owner's seat
+  (1 forward step, captures on the 3 forward diagonals) but: no double-step,
+  NEVER promotes, and after completing its 3rd move it CRUMBLES (removed from
+  the board, appended to lost[] as "SK", log "...crumbles to dust"). uses
+  increments per completed move (incl. capturing moves). SK may enter
+  graveyard cells (see below).
+- **NE Necromancer raise v4**: consumes a lost pawn as before but places an
+  SK (moved=True, uses=0) instead of a P. Log mentions a skeleton.
+- **BM Bomber fuse**: uses increments per completed move; the move that makes
+  uses == 10 detonates it at its destination after the move resolves
+  (normal explosion rules; log "...fuse runs out"). Explosions from capture
+  work as before regardless of count.
+- **Graveyards**: GameState gains `graveyards: set[cell]` and
+  `graves_left: dict[pid,int]`. On elimination a player gets graves_left = 1.
+  New API `apply_grave(pid, cell) -> (ok, err)`: valid iff player is DEAD,
+  graves_left>0, cell on board, cell EMPTY and not already a graveyard.
+  Effect: cell joins graveyards, decrement graves_left, log
+  "NAME curses a tile from beyond the grave". NOT turn-based — dead players
+  may do it any time; does not advance the turn.
+  Movement rules: NO destination may be a graveyard cell except for SK moves
+  and NE "raise" targets (skeletons rise from graves fine). Shoot targets are
+  pieces, so skeletons standing on a graveyard can still be shot (no change
+  needed). Pieces cannot land there via any move kind, including jumps and
+  charges; slides/charges are BLOCKED by graveyard cells (treat like an
+  impassable wall for path purposes: a slide ray stops before it; ghost may
+  phase THROUGH but not land; wizard/knight/valkyrie jumps simply exclude it).
+  to_dict: "graveyards": [[q,r],...], "graves_left": {str(pid): int} (both
+  optional on from_dict for back-compat).
+- PIECE_NAMES/DESCRIPTIONS gain SK ("Skeleton"), casual voice; note the
+  3-move crumble.
+- Quiet-start invariant unaffected (no SK/graveyards at start) but re-run the
+  suite; extend fuzz so some games include necromancer raises producing SK and
+  a mid-game elimination followed by apply_grave.
+
+## V4.2 net.py: grave action + update check; PROTOCOL_VERSION = 4
+
+- New client->server message {"t":"grave","cell":[q,r]} -> apply_grave(pid),
+  broadcast state on success (last_move: {"pid": pid, "move": {"from": cell,
+  "to": cell, "kind": "grave"}}), error to sender on failure. Host-side
+  method HostServer.submit_host_grave(cell).
+- PROTOCOL_VERSION = 4 (SK + graveyards cross the wire).
+- **Release check helpers** (stdlib urllib, exception-proof):
+```python
+GITHUB_REPO = "CoopNutt/chess3"
+def get_latest_release(timeout=4.0) -> dict|None
+    # GET https://api.github.com/repos/{GITHUB_REPO}/releases/latest
+    # -> {"tag": "v4.0.0", "url": browser_download_url of the Chess3.exe asset,
+    #     "notes": body} or None (no release / no exe asset / any failure)
+def download_file(url, dest_path, timeout=30.0) -> bool
+    # streams to dest_path, False on any failure (partial file removed)
+```
+- Tests: grave flow over the wire (eliminate a player via disconnect, submit
+  grave, all clients converge; rejected while alive / occupied cell / twice),
+  SK serialization roundtrip over the wire, version gate now kicks ver 3.
+  get_latest_release/download_file are NOT exercised against real GitHub —
+  test only their error paths with an unroutable URL.
+
+## V4.3 icons.py / diagrams.py
+
+- SK glyph: small skull + ribcage hint, matching house style; TYPE_ORDER 21.
+- `draw_tombstone(surface, center, size)`: rounded gravestone + cross, for
+  graveyard tiles.
+- `draw_cracks(surface, points_seed_cell, center, size, color)`: deterministic
+  jagged crack polylines (seeded from the cell coords so every client draws
+  identical cracks; 2-4 branches, stays inside the hex).
+- diagrams: SK demo (forward step + capture diags).
+
+## V4.4 UI v4 (main.py — mine)
+
+Animation profiles per piece type (speed/easing/effects), particle system
+(smoke, wind arcs, afterimages, lightning, fire, spawn glow, arrow/cannonball
+projectiles, black trail), permanent client-side cracked-tile overlay set fed
+by move semantics (JG path, CT/DR/WZ landings, BM blast area, CN target),
+graveyard rendering (blacked tile + tombstone), skeleton uses indicator (tiny
+pips), dead-player "curse a tile" flow, in-game help filtered to types present
+in the match, startup update check with in-app prompt -> download to
+Chess3_new.exe -> swap-and-restart via a generated .bat, VERSION constant.
+
+New sounds (sounds.py): grind, slam, lightning, fire, whoosh, cannon, rattle.

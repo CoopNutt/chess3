@@ -303,7 +303,7 @@ PIECE_NAMES = {
     "P": "Pawn", "CN": "Cannon", "AR": "Archer", "WZ": "Wizard",
     "DR": "Dragon", "CH": "Champion", "BM": "Bomber", "GH": "Ghost",
     "NE": "Necromancer", "CT": "Catapult", "VA": "Valkyrie", "GO": "Golem",
-    "JG": "Juggernaut", "SN": "Sniper", "WD": "Warden",
+    "JG": "Juggernaut", "SN": "Sniper", "WD": "Warden", "SK": "Skeleton",
 }
 
 PIECE_DESCRIPTIONS = {
@@ -318,18 +318,21 @@ PIECE_DESCRIPTIONS = {
     "WZ": "Blinks to any tile within 2. Walls? Pieces? A teleport doesn't ask.",
     "DR": "Flies up to 3 tiles in any direction, straight or diagonal. Short range, huge coverage.",
     "CH": "Hops 1 or 2 tiles straight, or 1 diagonal — leaping clean over anything in between.",
-    "BM": "Trundles up to 2 tiles straight. The moment it kills or dies, it BLOWS UP and wipes every neighbour — only Kings and Golems walk away.",
+    "BM": "Trundles up to 2 tiles straight. The moment it kills or dies, it BLOWS UP and wipes every neighbour — only Kings and Golems walk away. Oh, and the fuse is lit: its 10th move sets it off no matter what.",
     "GH": "Drifts up to 3 diagonal tiles, phasing straight THROUGH other pieces. Walls mean nothing to the dead.",
-    "NE": "Creeps 1 diagonal tile — or spends one of your dead pawns to raise it fresh on a tile beside him.",
+    "NE": "Creeps 1 diagonal tile — or spends one of your dead pawns to raise a SKELETON on a tile beside him. Graveyard tiles work too.",
     "CT": "Crawls one tile, but lobs a shot exactly 3 tiles down a straight line — sailing over everyone's heads. Can't dent a Golem.",
     "VA": "Swoops like a Knight or steps 1 diagonal. Two attack patterns, one piece, zero blockers.",
     "GO": "Stomps 1 tile straight. Arrows bounce off, catapult shots too, explosions just tickle — only a real capture puts it down.",
     "JG": "Charges up to 5 tiles down a straight lane with zero brakes — it either smashes the first enemy in its path or skids to a stop right before whatever blocks it. No parking halfway.",
     "SN": "Sidles 1 diagonal tile, but headshots enemies exactly 2 diagonal tiles out — without moving, straight over anyone's head. Golems just shrug it off.",
     "WD": "Walks 1 tile any direction, like a King. Friends standing right beside it (straight-adjacent) can't be taken by normal moves — though shots and explosions still get through, and nobody guards the guard itself.",
+    "SK": "A pawn back from the dead — shuffles forward, stabs on the forward diagonals, and strolls right over graveyard tiles. The glue only holds for 3 moves, then it crumbles. Never promotes.",
 }
 
-MOVE_KINDS = ("move", "shoot", "raise")
+# "grave" never comes out of movegen — it is the wire/UI pseudo-kind for a
+# dead player cursing a tile (see apply_grave); Move.from_dict accepts it.
+MOVE_KINDS = ("move", "shoot", "raise", "grave")
 
 # Swappable troops (v2 added CT/VA/GO, v3 added JG/SN/WD): `swaps` maps a
 # DEFAULT troop type to its replacement, e.g. {"CN": "CT", "GH": "VA"};
@@ -391,21 +394,31 @@ _WZ_OFFSETS = tuple(sorted(
 
 
 class Piece:
-    """A piece on the board; `owner` is a player id (int)."""
+    """A piece on the board; `owner` is a player id (int).
 
-    __slots__ = ("type", "owner", "moved")
+    `uses` counts COMPLETED moves for pieces that care (v4): a Skeleton
+    crumbles after its 3rd move, a Bomber's fuse detonates it on its 10th.
+    """
 
-    def __init__(self, type, owner, moved=False):
+    __slots__ = ("type", "owner", "moved", "uses")
+
+    def __init__(self, type, owner, moved=False, uses=0):
         self.type = type
         self.owner = owner
         self.moved = moved
+        self.uses = uses
 
     def __repr__(self):
-        return "Piece(%r, %r, moved=%r)" % (self.type, self.owner, self.moved)
+        return "Piece(%r, %r, moved=%r, uses=%r)" % (
+            self.type, self.owner, self.moved, self.uses)
 
 
 class Move:
-    """A move order with value semantics; kind in {"move", "shoot", "raise"}."""
+    """A move order with value semantics; kind is one of MOVE_KINDS.
+
+    Movegen only ever produces "move" / "shoot" / "raise"; "grave" exists
+    so the dead-player tile-curse can ride the same wire format (net/UI).
+    """
 
     __slots__ = ("from_", "to", "kind")
 
@@ -468,6 +481,8 @@ class GameState:
         self.lost = {}         # pid -> [type, ...] pieces that pid has LOST
         self.winner = None     # None=ongoing, pid=winner, -1=draw
         self.log = []          # human-readable event lines (last 200)
+        self.graveyards = set()   # cursed cells (see apply_grave)
+        self.graves_left = {}     # pid -> curses remaining (granted on death)
         self._cells = _shape_cells_frozen(shape, radius)
         self._boom = deque()       # pending explosion centers
         self._dead_kings = []      # owners whose king died this resolution
@@ -618,6 +633,7 @@ class GameState:
 
         Diagonal rays are only ever blocked by pieces ON the ray cells, so
         walking the ray cells implements the hex diagonal rule directly.
+        Graveyard cells are impassable walls: the ray stops BEFORE them.
         """
         moves = []
         limit = max_steps if max_steps is not None else 4 * self.radius
@@ -626,7 +642,7 @@ class GameState:
             for _ in range(limit):
                 q += dq
                 r += dr
-                if (q, r) not in self._cells:
+                if (q, r) not in self._cells or (q, r) in self.graveyards:
                     break
                 occ = self.board.get((q, r))
                 if occ is None:
@@ -639,11 +655,14 @@ class GameState:
         return moves
 
     def _jumps(self, cell, owner, offsets):
-        """Jump moves (ignore blockers) to empty or enemy cells."""
+        """Jump moves (ignore blockers) to empty or enemy cells.
+
+        Graveyard cells are never valid landing spots (v4).
+        """
         moves = []
         for dq, dr in offsets:
             t = (cell[0] + dq, cell[1] + dr)
-            if t not in self._cells:
+            if t not in self._cells or t in self.graveyards:
                 continue
             occ = self.board.get(t)
             if occ is None or (occ.owner != owner
@@ -667,6 +686,39 @@ class GameState:
         return self._jumps(cell, pc.owner, KNIGHT)
 
     def _moves_P(self, cell, pc):
+        # Graveyards block pawns like walls: no stepping on one, and a
+        # double-step may not pass over one either.
+        f1, f2 = shape_edge_forward(self.shape, self._seat(pc.owner))
+        q, r = cell
+        moves = []
+        for fdq, fdr in (f1, f2):
+            one = (q + fdq, r + fdr)
+            if (one in self._cells and one not in self.board
+                    and one not in self.graveyards):
+                moves.append(Move(cell, one))
+                if not pc.moved:
+                    two = (q + 2 * fdq, r + 2 * fdr)
+                    if (two in self._cells and two not in self.board
+                            and two not in self.graveyards):
+                        moves.append(Move(cell, two))
+        # Captures ONLY on the 3 forward diagonals (never blocked).
+        for ddq, ddr in ((f1[0] + f2[0], f1[1] + f2[1]),
+                         (2 * f1[0] - f2[0], 2 * f1[1] - f2[1]),
+                         (2 * f2[0] - f1[0], 2 * f2[1] - f1[1])):
+            t = (q + ddq, r + ddr)
+            occ = self.board.get(t)
+            if (t in self._cells and t not in self.graveyards
+                    and occ is not None and occ.owner != pc.owner
+                    and not self._protected(t, occ.owner)):
+                moves.append(Move(cell, t))
+        return moves
+
+    def _moves_SK(self, cell, pc):
+        # Skeleton (v4): pawn-style movement for its owner's seat — one
+        # forward step (F1/F2) to an empty cell, captures ONLY on the 3
+        # forward diagonals — but NO double-step and it NEVER promotes.
+        # Uniquely, skeletons may enter graveyard cells.  (Its 3-move
+        # crumble lives in apply_move.)
         f1, f2 = shape_edge_forward(self.shape, self._seat(pc.owner))
         q, r = cell
         moves = []
@@ -674,11 +726,6 @@ class GameState:
             one = (q + fdq, r + fdr)
             if one in self._cells and one not in self.board:
                 moves.append(Move(cell, one))
-                if not pc.moved:
-                    two = (q + 2 * fdq, r + 2 * fdr)
-                    if two in self._cells and two not in self.board:
-                        moves.append(Move(cell, two))
-        # Captures ONLY on the 3 forward diagonals (never blocked).
         for ddq, ddr in ((f1[0] + f2[0], f1[1] + f2[1]),
                          (2 * f1[0] - f2[0], 2 * f1[1] - f2[1]),
                          (2 * f2[0] - f1[0], 2 * f2[1] - f1[1])):
@@ -694,14 +741,15 @@ class GameState:
         # Quiet slides to empty cells only (cannot capture by sliding).
         moves = self._slide(cell, pc.owner, ORTHO, capture=False)
         # Screen jump: exactly one intervening piece, then the FIRST piece
-        # beyond it; capture it if it is an enemy.
+        # beyond it; capture it if it is an enemy.  A graveyard cell walls
+        # off the ray (and can never be landed on anyway).
         for dq, dr in ORTHO:
             q, r = cell
             seen_screen = False
             while True:
                 q += dq
                 r += dr
-                if (q, r) not in self._cells:
+                if (q, r) not in self._cells or (q, r) in self.graveyards:
                     break
                 occ = self.board.get((q, r))
                 if occ is None:
@@ -743,6 +791,7 @@ class GameState:
     def _moves_GH(self, cell, pc):
         # Up to GHOST_RANGE diagonal steps, passing THROUGH occupied cells;
         # may land on any empty or enemy cell along the ray (not friendly).
+        # Ghosts phase THROUGH graveyard cells but may not land on them.
         moves = []
         for dq, dr in DIAG:
             q, r = cell
@@ -751,6 +800,8 @@ class GameState:
                 r += dr
                 if (q, r) not in self._cells:
                     break
+                if (q, r) in self.graveyards:
+                    continue
                 occ = self.board.get((q, r))
                 if occ is None or (occ.owner != pc.owner
                                    and not self._protected((q, r), occ.owner)):
@@ -759,6 +810,8 @@ class GameState:
 
     def _moves_NE(self, cell, pc):
         moves = self._jumps(cell, pc.owner, DIAG)
+        # Raise (v4: spawns a Skeleton): any EMPTY ortho-adjacent cell —
+        # graveyard cells included; skeletons rise from graves just fine.
         if "P" in self.lost.get(pc.owner, ()):
             for dq, dr in ORTHO:
                 t = (cell[0] + dq, cell[1] + dr)
@@ -793,7 +846,7 @@ class GameState:
         # within range (capture) or the last EMPTY cell before a blocker /
         # board edge / the step cap.  No stopping midway on empty cells.
         # A warden-protected enemy acts like a blocker: the charge stops
-        # on the cell before it.
+        # on the cell before it.  So does a graveyard cell (impassable).
         moves = []
         owner = pc.owner
         for dq, dr in ORTHO:
@@ -804,7 +857,7 @@ class GameState:
             for _ in range(JUGGERNAUT_RANGE):
                 q += dq
                 r += dr
-                if (q, r) not in self._cells:
+                if (q, r) not in self._cells or (q, r) in self.graveyards:
                     break
                 occ = self.board.get((q, r))
                 if occ is None:
@@ -844,7 +897,8 @@ class GameState:
             "WZ": _moves_WZ, "DR": _moves_DR, "CH": _moves_CH,
             "BM": _moves_BM, "GH": _moves_GH, "NE": _moves_NE,
             "CT": _moves_CT, "VA": _moves_VA, "GO": _moves_GO,
-            "JG": _moves_JG, "SN": _moves_SN, "WD": _moves_WD}
+            "JG": _moves_JG, "SN": _moves_SN, "WD": _moves_WD,
+            "SK": _moves_SK}
 
     # -- attacks ------------------------------------------------------------
 
@@ -889,9 +943,11 @@ class GameState:
         name = self._name(pid)
 
         if move.kind == "raise":
+            # v4: raising consumes a lost Pawn but yields a Skeleton.
             self.lost[pid].remove("P")
-            self.board[move.to] = Piece("P", pid, True)
-            self._log("%s's Necromancer raises a Pawn from the dead!" % name)
+            self.board[move.to] = Piece("SK", pid, True)
+            self._log("%s's Necromancer raises a Skeleton from the dead!"
+                      % name)
         elif move.kind == "shoot":
             victim = self.board[move.to]
             self._log("%s's %s shoots %s's %s!" %
@@ -911,16 +967,28 @@ class GameState:
             # quiet moves are not logged — the board highlight shows them
             del self.board[move.from_]
             pc.moved = True
+            pc.uses += 1              # v4: completed moves (SK / BM care)
             self.board[move.to] = pc
             if victim is not None and pc.type == "BM":
                 # A bomber that captures explodes on its landing cell and
-                # dies in its own explosion.
+                # dies in its own explosion (which also ends its fuse).
                 self._kill(move.to)
             self._resolve_explosions()
             survivor = self.board.get(move.to)
             if survivor is pc and pc.type == "P" and self._promotes(move.to, pid):
                 pc.type = "Q"
                 self._log("%s's Pawn becomes a QUEEN!" % name)
+            elif survivor is pc and pc.type == "SK" and pc.uses >= 3:
+                # Skeletons crumble after their 3rd completed move.
+                del self.board[move.to]
+                self.lost[pid].append("SK")
+                self._log("%s's Skeleton crumbles to dust." % name)
+            elif survivor is pc and pc.type == "BM" and pc.uses >= 10:
+                # The fuse runs out on the 10th completed move: the bomber
+                # detonates at its destination after the move resolves.
+                self._log("%s's Bomber's fuse runs out!" % name)
+                self._kill(move.to)
+                self._resolve_explosions()
 
         for owner in self._dead_kings:
             if self._is_alive(owner):
@@ -969,6 +1037,7 @@ class GameState:
         if p is None or not p["alive"]:
             return
         p["alive"] = False
+        self.graves_left[pid] = 1   # v4: one tile-curse, granted on death
         for cell in [c for c, pc in self.board.items() if pc.owner == pid]:
             del self.board[cell]
         self._log("%s is eliminated (%s)." % (self._name(pid), reason))
@@ -976,6 +1045,38 @@ class GameState:
         if self.winner is None and self.turn_pid == pid:
             # The player to move vanished (e.g. disconnect): pass the turn on.
             self._advance_turn()
+
+    def apply_grave(self, pid, cell):
+        """A DEAD player curses one empty tile, turning it into a graveyard.
+
+        Valid iff `pid` is dead, has a curse left (granted on elimination),
+        and `cell` is an on-board EMPTY cell that is not already a
+        graveyard.  NOT turn-based: dead players may do this at any time
+        and the turn does not advance.  Returns (True, None) on success,
+        else (False, reason).
+        """
+        try:
+            cell = (int(cell[0]), int(cell[1]))
+        except (TypeError, ValueError, IndexError):
+            return False, "Malformed cell"
+        p = self._player(pid)
+        if p is None:
+            return False, "No such player"
+        if p["alive"]:
+            return False, "Only dead players can curse tiles"
+        if self.graves_left.get(pid, 0) < 1:
+            return False, "No curses left"
+        if cell not in self._cells:
+            return False, "Not a board cell"
+        if cell in self.board:
+            return False, "That tile is occupied"
+        if cell in self.graveyards:
+            return False, "Already a graveyard"
+        self.graveyards.add(cell)
+        self.graves_left[pid] -= 1
+        self._log("%s curses a tile from beyond the grave"
+                  % self._name(pid))
+        return True, None
 
     def force_skip(self, pid):
         """Skip `pid`'s turn because their move timer expired.
@@ -1054,18 +1155,24 @@ class GameState:
                          "alive": bool(p["alive"]), "color": p["color"]}
                         for p in self.players],
             "turn_pid": self.turn_pid,
-            "board": [[q, r, pc.type, pc.owner, 1 if pc.moved else 0]
+            "board": [[q, r, pc.type, pc.owner, 1 if pc.moved else 0,
+                       pc.uses]
                       for (q, r), pc in sorted(self.board.items())],
             "lost": {str(pid): list(types) for pid, types in self.lost.items()},
             "winner": self.winner,
             "log": list(self.log[-50:]),
+            "graveyards": [[q, r] for q, r in sorted(self.graveyards)],
+            "graves_left": {str(pid): int(n)
+                            for pid, n in self.graves_left.items()},
         }
 
     @staticmethod
     def from_dict(d):
         """Rebuild a GameState from to_dict() output (exact round-trip).
 
-        v1 dicts have no "shape" key; they default to "hexagon".
+        Back-compat: v1 dicts have no "shape" key (default "hexagon");
+        pre-v4 dicts have 5-element board rows (uses defaults to 0) and no
+        "graveyards" / "graves_left" keys (default empty).
         """
         gs = GameState(int(d["radius"]), str(d.get("shape", "hexagon")))
         gs.players = [{"pid": int(p["pid"]), "name": str(p["name"]),
@@ -1073,8 +1180,11 @@ class GameState:
                        "color": int(p["color"])}
                       for p in d["players"]]
         gs.turn_pid = int(d["turn_pid"])
-        for q, r, t, owner, moved in d["board"]:
-            gs.board[(int(q), int(r))] = Piece(t, int(owner), bool(moved))
+        for row in d["board"]:
+            q, r, t, owner, moved = row[:5]
+            uses = int(row[5]) if len(row) > 5 else 0
+            gs.board[(int(q), int(r))] = Piece(t, int(owner), bool(moved),
+                                               uses)
         gs.lost = {int(pid): list(types)
                    for pid, types in d.get("lost", {}).items()}
         for p in gs.players:
@@ -1082,4 +1192,8 @@ class GameState:
         w = d.get("winner")
         gs.winner = None if w is None else int(w)
         gs.log = [str(x) for x in d.get("log", [])]
+        gs.graveyards = {(int(q), int(r))
+                         for q, r in d.get("graveyards", [])}
+        gs.graves_left = {int(pid): int(n)
+                          for pid, n in d.get("graves_left", {}).items()}
         return gs

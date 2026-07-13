@@ -39,9 +39,9 @@ class TestDiagrams(unittest.TestCase):
     def tearDown(self):
         _reset_style()
 
-    def test_all_20_types_render_non_blank(self):
+    def test_all_21_types_render_non_blank(self):
         """Every type in TYPE_ORDER renders at widths 180 and 240."""
-        self.assertEqual(len(icons.TYPE_ORDER), 20)
+        self.assertEqual(len(icons.TYPE_ORDER), 21)
         for ptype in icons.TYPE_ORDER:
             self.assertIn(ptype, engine.PIECE_NAMES,
                           "engine lacks type %s" % ptype)
@@ -157,9 +157,32 @@ class TestDiagrams(unittest.TestCase):
         self.assertTrue(all(m.to in window for m in moves))
         diagrams.movement_diagram("WD", 240)
 
+    def test_skeleton_demo_forward_and_captures(self):
+        """The SK demo (v4) shows the two quiet forward steps AND all 3
+        forward-diagonal captures (>= 1 capture marker), with no
+        double-step — everything inside the window."""
+        gs = diagrams.demo_state("SK")
+        window = engine.board_cells(diagrams.window_radius("SK"))
+        moves = diagrams.demo_moves("SK")
+        self.assertTrue(all(m.to in window for m in moves))
+        self.assertTrue(all(m.kind == "move" for m in moves))
+        quiets = {m.to for m in moves if m.to not in gs.board}
+        captures = {m.to for m in moves if m.to in gs.board}
+        # seat edge 0: forward steps F1=(0,-1), F2=(1,-1)
+        self.assertEqual(quiets, {(0, -1), (1, -1)})
+        # the 3 capture diagonals, each holding a demo enemy
+        self.assertGreaterEqual(len(captures), 1)
+        self.assertEqual(captures, {(1, -2), (-1, -1), (2, -1)})
+        for c in captures:
+            self.assertNotEqual(gs.board[c].owner, 0)
+        # no pawn-style double-step for skeletons
+        self.assertNotIn((0, -2), {m.to for m in moves})
+        self.assertNotIn((2, -2), {m.to for m in moves})
+        diagrams.movement_diagram("SK", 240)
+
     def test_markers_match_engine_movegen(self):
         """demo_moves is exactly the engine movegen for the demo state."""
-        for ptype in ("CN", "BM", "GH", "P", "JG", "SN", "WD"):
+        for ptype in ("CN", "BM", "GH", "P", "JG", "SN", "WD", "SK"):
             gs = diagrams.demo_state(ptype)
             expected = gs.legal_moves((0, 0))
             got = diagrams.demo_moves(ptype)

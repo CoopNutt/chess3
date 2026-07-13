@@ -99,6 +99,44 @@ def _build(name):
     if name == "promote":       # sparkle up
         return _mix(_seg(784, 0.1, 0.35, 12), _seg(1046, 0.1, 0.35, 12),
                     _seg(1568, 0.2, 0.35, 9))
+    if name == "grind":         # stone dragging (golem/skeleton steps)
+        n = int(_SR * 0.35)
+        t = np.linspace(0, 0.35, n, False)
+        noise = np.random.default_rng(3).uniform(-1, 1, n)
+        wobble = 0.55 + 0.45 * np.sin(2 * np.pi * 9 * t)
+        return _mix(noise * wobble * np.exp(-3.5 * t) * 0.4,
+                    _seg(70, 0.2, 0.3, 10))
+    if name == "slam":          # heavy landing (catapult/champion/dragon)
+        return _mix(_seg(0, 0.08, 0.9, 22, "noise"),
+                    _seg(55, 0.3, 0.9, 9),
+                    _seg(110, 0.12, 0.4, 16, "square"))
+    if name == "lightning":     # wizard strike: crack + sizzle
+        return _mix(_seg(0, 0.04, 1.0, 50, "noise"),
+                    _seg(1800, 0.06, 0.5, 30),
+                    _seg(0, 0.25, 0.5, 9, "noise"))
+    if name == "fire":          # dragon breath
+        n = int(_SR * 0.45)
+        t = np.linspace(0, 0.45, n, False)
+        noise = np.random.default_rng(9).uniform(-1, 1, n)
+        swell = np.minimum(1.0, t * 8) * np.exp(-4 * t)
+        return _mix(noise * swell * 0.55, _seg(140, 0.4, 0.25, 6))
+    if name == "whoosh":        # valkyrie spin / champion dash
+        n = int(_SR * 0.22)
+        t = np.linspace(0, 0.22, n, False)
+        noise = np.random.default_rng(5).uniform(-1, 1, n)
+        sweep = np.sin(2 * np.pi * (6 + 30 * t) * t)
+        return _mix(noise * np.abs(sweep) * np.exp(-7 * t) * 0.45)
+    if name == "cannon":        # cannonball launch
+        return _mix(_seg(0, 0.1, 0.8, 18, "noise"),
+                    _seg(80, 0.25, 0.8, 10),
+                    _seg(45, 0.2, 0.5, 8))
+    if name == "rattle":        # skeleton rises
+        parts = []
+        for i in range(4):
+            parts.append(_seg(900 - i * 120, 0.035, 0.4, 45, "square"))
+            parts.append(_silence(0.025))
+        parts.append(_seg(160, 0.2, 0.3, 10))
+        return _mix(*parts)
     return _mix(_seg(1000, 0.05, 0.3, 30))
 
 

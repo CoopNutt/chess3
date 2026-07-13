@@ -47,6 +47,23 @@ with; star the ones you like.
 
 Press **H** anytime — every troop has a movement picture.
 
+## v4 goodies
+
+- **Every troop moves in its own style**: the Juggernaut accelerates with a
+  smoke trail, the Wizard phases in with a lightning strike, the Dragon flies
+  up and slams down breathing fire, the Champion dashes with afterimages, the
+  Valkyrie spins in a whirlwind, ghosts turn translucent... and heavy impacts
+  **permanently crack the tiles** they hit.
+- **Skeletons**: the Necromancer now raises skeletons — they fight like pawns
+  but crumble to dust after 3 moves (watch their little green pips).
+- **Bomber fuse**: bombers detonate automatically on their 10th move. Plan
+  accordingly.
+- **Graveyard curse**: when you're eliminated you get one act of revenge —
+  click any empty tile to blacken it with a tombstone. Nothing can ever stand
+  there again... except skeletons.
+- **Auto-updates**: the game checks GitHub on startup and offers one-click
+  update & restart when a new release is out.
+
 ## v3 goodies
 
 - **Zoom & pan**: mouse wheel zooms, right/middle-drag pans, **R** resets.
