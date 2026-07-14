@@ -337,7 +337,7 @@ PIECE_DESCRIPTIONS = {
     "WD": "Walks 1 tile any direction, like a King. Friends standing right beside it (straight-adjacent) can't be taken by normal moves — though shots and explosions still get through, and nobody guards the guard itself.",
     "SK": "A pawn back from the dead — shuffles forward, stabs on the forward diagonals, and strolls right over graveyard tiles. The glue only holds for 3 moves, then it crumbles. Never promotes.",
     "TF": "Slides straight like a Rook but never hurts anyone. Instead it SWAPS places with the first piece within 3 straight tiles — friend or enemy, your pick. Kings are off-limits, and nobody ever fears a Thief.",
-    "SH": "Steps 1 tile straight — any way except dead sideways. Every kill feeds it a SOUL; spend souls to permanently morph into almost any other piece. Pawns are free, a Queen runs you 5.",
+    "SH": "Steps 1 tile straight or diagonal — any way except dead sideways. Every kill feeds it a SOUL; spend souls to permanently morph into almost any other piece. Pawns are free, a Queen runs you 5.",
     "MI": "A perfect copycat: it moves exactly like the LAST piece anyone moved. Rook slid? It's a rook now. Archer sniped? It snipes. New personality every single turn.",
 }
 
@@ -351,9 +351,11 @@ MOVE_KINDS = ("move", "shoot", "raise", "swap", "morph", "grave")
 # each replacement may be used at most once.  v5: the classic R/N/B/Q became
 # swappable too — swapping one replaces ALL pieces of that type in every
 # army (both rooks / both knights).  "P" and "K" stay unswappable.
-SWAP_TROOPS = ("CT", "VA", "GO", "JG", "SN", "WD", "TF", "SH", "MI")
+# v5.1: Thief and Mimic joined the base army, so they left the swap pool
+# and became swappable slots themselves.
+SWAP_TROOPS = ("CT", "VA", "GO", "JG", "SN", "WD", "SH")
 SWAPPABLE_TYPES = ("CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE",
-                   "R", "N", "B", "Q")
+                   "R", "N", "B", "Q", "TF", "MI")
 
 # v5: max ortho steps between a Thief and its swap partner.
 THIEF_RANGE = 3
@@ -376,7 +378,9 @@ MORPH_COSTS = {
 # _ROW_SHIFTS and BOARD_RADIUS) was searched so that every start position
 # is quiet; do not reorder casually — TestQuietStart will catch regressions.
 _ARMY_ROWS = (
-    ("DR", "N", "R", "K", "Q", "R", "N"),
+    # v5.1: the Thief takes the left rook's place, the Mimic the right
+    # knight's — one newcomer on each side of the King.
+    ("DR", "N", "TF", "K", "Q", "R", "MI"),
     ("BM", "NE", "GH", "B", "CN", "CH", "AR", "WZ"),
     ("P",) * 4,
     ("P",) * 5,
@@ -423,7 +427,9 @@ _WZ_OFFSETS = tuple(sorted(
 # v5 Shaman: the 4 ortho dirs excluding the two horizontal "sides"
 # (1,0)/(-1,0).  The set is symmetric under negation, which the reverse
 # attack test in _cell_attacked relies on.
-_SH_DIRS = ((0, 1), (-1, 1), (0, -1), (1, -1))
+# v5.1 buff: the 4 non-sideways ortho steps PLUS the necromancer's 6
+# diagonal steps (10 directions total, all range 1).
+_SH_DIRS = ((0, 1), (-1, 1), (0, -1), (1, -1)) + tuple(DIAG)
 _SH_DIR_SET = frozenset(_SH_DIRS)
 
 
@@ -1224,11 +1230,12 @@ class GameState:
                 if enemy(pc):
                     t = eff(pc)
                     # NB: no "K" here — kings only capture on the 6 ortho
-                    # neighbours (see _moves_K)
+                    # neighbours (see _moves_K). SH gained the diagonal
+                    # step in v5.1.
                     if (t in ("B", "Q")
                             or (t == "DR" and steps <= 3)
                             or (steps == 1 and t in ("NE", "VA", "WD",
-                                                     "CH"))):
+                                                     "CH", "SH"))):
                         return True
                 break
 

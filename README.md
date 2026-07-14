@@ -46,9 +46,9 @@ Some troop highlights:
 | Juggernaut | Charges up to 5 tiles and hits the first thing in its path |
 | Warden | Pieces next to it cannot be captured by normal moves |
 | Golem | Immune to arrows, boulders and explosions |
-| Thief | Never fights, swaps places with any nearby piece instead |
+| Thief | Never fights, swaps places with any nearby piece instead. In every starting army |
 | Shaman | Collects a soul per kill, spend them to morph into other troops |
-| Mimic | Moves like whatever piece was moved last in the game |
+| Mimic | Moves like whatever piece was moved last in the game. In every starting army |
 
 Heavy hits crack the tiles permanently. Right click draws planning arrows
 like chess.com. Select any piece to see its moves, what it can take and what

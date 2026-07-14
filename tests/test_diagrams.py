@@ -218,17 +218,19 @@ class TestDiagrams(unittest.TestCase):
         self.assertNotEqual(idx, -1,
                             "no SWAP_COLOR pixel on the TF diagram")
 
-    def test_shaman_demo_four_dirs_no_sideways(self):
-        """The SH demo (v5) shows exactly 4 quiet step dots, and the two
+    def test_shaman_demo_ten_dirs_no_sideways(self):
+        """The SH demo (v5.1) shows exactly 10 quiet step dots — the 4
+        non-sideways ortho steps plus the 6 diagonals — and the two
         horizontal side dirs (1,0)/(-1,0) are NOT among them. Its free
         morph moves exist in movegen but are never painted as markers."""
         gs = diagrams.demo_state("SH")
         window = engine.board_cells(diagrams.window_radius("SH"))
         moves = diagrams.demo_moves("SH")
         steps = [m for m in moves if m.kind == "move"]
-        self.assertEqual(len(steps), 4)
+        self.assertEqual(len(steps), 10)
         offs = {m.to for m in steps}
-        self.assertEqual(offs, {(0, 1), (-1, 1), (0, -1), (1, -1)})
+        self.assertEqual(offs, {(0, 1), (-1, 1), (0, -1), (1, -1)}
+                         | set(engine.DIAG))
         self.assertNotIn((1, 0), offs)
         self.assertNotIn((-1, 0), offs)
         for m in steps:

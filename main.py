@@ -90,7 +90,7 @@ set_theme("Classic")
 
 CFG_PATH = Path.home() / ".chess3.json"
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 
 # Per-troop movement animation profiles.
 #   dur: seconds  |  ease: out / in_expo (accelerate) / steps (fast increments)
@@ -129,7 +129,7 @@ ANIM_PROFILES = {
 SHAPE_CYCLE = ["hexagon", "square", "triangle", "octagon"]
 MOVE_TIMER_OPTS = [0, 15, 30, 60, 120]
 TOTAL_TIMER_OPTS = [0, 5, 10, 20, 30]
-SWAP_TROOPS = ["CT", "VA", "GO", "JG", "SN", "WD", "TF", "SH", "MI"]
+SWAP_TROOPS = ["CT", "VA", "GO", "JG", "SN", "WD", "SH"]
 SWAP_SHORT = {"CT": "Catapult", "VA": "Valkyrie", "GO": "Golem",
               "JG": "Jugger", "SN": "Sniper", "WD": "Warden",
               "TF": "Thief", "SH": "Shaman", "MI": "Mimic",
@@ -137,7 +137,7 @@ SWAP_SHORT = {"CT": "Catapult", "VA": "Valkyrie", "GO": "Golem",
               "BM": "Bomber", "GH": "Ghost", "NE": "Necro", "DR": "Dragon",
               "R": "Rook", "N": "Knight", "B": "Bishop", "Q": "Queen"}
 SWAP_TARGETS = [None, "CN", "AR", "WZ", "CH", "BM", "GH", "NE", "DR",
-                "R", "N", "B", "Q"]
+                "R", "N", "B", "Q", "TF", "MI"]
 
 _fonts = {}
 
@@ -2624,7 +2624,7 @@ class App:
                   "BM", "GH", "NE", "SK", "CT", "VA", "GO", "JG", "SN", "WD",
                   "TF", "SH", "MI"]
     CLASSIC_TYPES = ("K", "Q", "R", "B", "N", "P")
-    SWAPPABLE_TYPES = ("CT", "VA", "GO", "JG", "SN", "WD", "TF", "SH", "MI")
+    SWAPPABLE_TYPES = ("CT", "VA", "GO", "JG", "SN", "WD", "SH")
 
     def _help_visible_types(self):
         """In a match: only the troops actually in THIS game (skeletons count

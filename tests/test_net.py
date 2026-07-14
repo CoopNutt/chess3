@@ -317,27 +317,29 @@ class TestMatchSettings(unittest.TestCase):
         self.assertEqual(self.server.get_settings(), net.DEFAULT_SETTINGS)
 
     def test_v5_swap_slots_and_troops(self):
-        # v5 widened both tables: TF/SH/MI are valid replacements and the
-        # classic R/N/B/Q became swappable slots.
+        # v5.1 tables: SH is a valid replacement; classic R/N/B/Q and the
+        # base TF/MI are swappable slots; TF/MI are no longer replacements.
         ok, err = self.server.set_settings(
-            {"swaps": {"R": "TF", "NE": "SH", "Q": "MI"}})
+            {"swaps": {"R": "CT", "NE": "SH", "Q": "WD", "TF": "JG"}})
         self.assertTrue(ok, err)
         lob = drain_last(self.server.events, "lobby")
         self.assertEqual(lob["settings"]["swaps"],
-                         {"R": "TF", "NE": "SH", "Q": "MI"})
+                         {"R": "CT", "NE": "SH", "Q": "WD", "TF": "JG"})
         # ... while dupes and unknowns are still rejected atomically
         for bad in (
-            {"R": "TF", "N": "TF"},    # TF used twice
+            {"R": "CT", "N": "CT"},    # CT used twice
             {"R": "XX"},               # unknown replacement
-            {"P": "TF"},               # pawns stay unswappable
+            {"P": "CT"},               # pawns stay unswappable
             {"K": "SH"},               # so do kings
-            {"TF": "SH"},              # swap troops are not slots
+            {"CN": "TF"},              # TF is base now, not a replacement
+            {"AR": "MI"},              # MI too
+            {"SH": "GO"},              # swap troops are not slots
         ):
             ok, err = self.server.set_settings({"swaps": bad})
             self.assertFalse(ok, "accepted bad swaps %r" % (bad,))
             self.assertTrue(err)
         self.assertEqual(self.server.get_settings()["swaps"],
-                         {"R": "TF", "NE": "SH", "Q": "MI"})
+                         {"R": "CT", "NE": "SH", "Q": "WD", "TF": "JG"})
 
     def test_settings_locked_after_start(self):
         self.join("Ann")
@@ -949,8 +951,9 @@ class TestThiefShamanWireGame(unittest.TestCase):
         return mh
 
     def test_thief_swap_and_shaman_morph_over_the_wire(self):
+        # v5.1: thieves are already in every base army; add shamans by swap
         ok, err = self.server.set_settings(
-            {"swaps": {"R": "TF", "NE": "SH"}})
+            {"swaps": {"NE": "SH"}})
         self.assertTrue(ok, err)
         ann = self.join("Ann")
         bob = self.join("Bob")
@@ -962,12 +965,12 @@ class TestThiefShamanWireGame(unittest.TestCase):
         self.assertEqual(sh0, sa0)
         self.assertEqual(sh0, sb0)
 
-        # the swaps really shaped the armies: both rooks in EVERY army
-        # became thieves, every necromancer slot a shaman
+        # the swap really shaped the armies: every necromancer slot became
+        # a shaman; base thieves/mimics are simply present (v5.1)
         types = [row[2] for row in sh0["board"]]
-        self.assertEqual(types.count("TF"), 6)
+        self.assertEqual(types.count("TF"), 3)
+        self.assertEqual(types.count("MI"), 3)
         self.assertEqual(types.count("SH"), 3)
-        self.assertNotIn("R", types)
         self.assertNotIn("NE", types)
         self.assertEqual(sh0["mimic"], "P")
 

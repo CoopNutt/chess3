@@ -83,8 +83,11 @@ class TestSetup(unittest.TestCase):
                 types = sorted(pc.type for pc in mine)
                 self.assertEqual(types.count("K"), 1)
                 self.assertEqual(types.count("P"), 9)
-                for nt in ("CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE"):
+                for nt in ("CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE",
+                           "TF", "MI"):   # v5.1: thief + mimic are base now
                     self.assertEqual(types.count(nt), 1, nt)
+                self.assertEqual(types.count("R"), 1)
+                self.assertEqual(types.count("N"), 1)
 
     def test_serialization_roundtrip(self):
         gs = fresh(6)
@@ -802,26 +805,29 @@ class TestSwaps(unittest.TestCase):
             self.assertEqual(types.count(rep), 1, rep)
         self.assertEqual(len(types), 24)
 
-    def test_all_nine_swap_troops_at_once(self):
-        # v5: 9 swap troops, 12 swappable slots — all nine in one army.
-        # The R slot holds TWO rooks, so its replacement appears twice.
+    def test_all_seven_swap_troops_at_once(self):
+        # v5.1: TF/MI joined the base army, leaving 7 swap troops across 14
+        # swappable slots — all seven in one army at once.
         swaps = {"CN": "CT", "AR": "SN", "WZ": "VA", "CH": "JG",
-                 "BM": "GO", "GH": "WD", "R": "TF", "NE": "SH", "B": "MI"}
-        self.assertEqual(len(engine.SWAP_TROOPS), 9)
+                 "BM": "GO", "GH": "WD", "NE": "SH"}
+        self.assertEqual(len(engine.SWAP_TROOPS), 7)
         gs = GameState.new_game([(0, "a"), (1, "b")], swaps=swaps)
         for pid in (0, 1):
             types = [pc.type for pc in gs.board.values() if pc.owner == pid]
             self.assertEqual(len(types), 24)
-            for rep in ("CT", "SN", "VA", "JG", "GO", "WD", "SH", "MI"):
+            for rep in ("CT", "SN", "VA", "JG", "GO", "WD", "SH"):
                 self.assertEqual(types.count(rep), 1, rep)
-            self.assertEqual(types.count("TF"), 2)   # both rooks
-            for gone in ("CN", "AR", "WZ", "CH", "BM", "GH", "R", "NE", "B"):
+            self.assertEqual(types.count("TF"), 1)   # base since v5.1
+            self.assertEqual(types.count("MI"), 1)
+            for gone in ("CN", "AR", "WZ", "CH", "BM", "GH", "NE"):
                 self.assertNotIn(gone, types)
 
     def test_v5_classic_slots_replace_all_of_that_type(self):
-        # Swapping a classic type replaces ALL pieces of it in every army.
-        for slot, rep, count in (("R", "TF", 2), ("N", "SH", 2),
-                                 ("B", "MI", 1), ("Q", "WD", 1)):
+        # Swapping a classic type replaces ALL pieces of it in every army
+        # (v5.1 armies carry ONE rook and ONE knight; TF/MI are slots too).
+        for slot, rep, count in (("R", "CT", 1), ("N", "GO", 1),
+                                 ("B", "SN", 1), ("Q", "WD", 1),
+                                 ("TF", "JG", 1), ("MI", "VA", 1)):
             gs = GameState.new_game([(0, "a"), (1, "b")],
                                     swaps={slot: rep})
             for pid in (0, 1):
@@ -992,9 +998,10 @@ class TestQuietStart(unittest.TestCase):
                  {"DR": "VA"}, {"WZ": "VA"}, {"NE": "CT"}, {"BM": "GO"},
                  {"CN": "JG"}, {"DR": "JG"}, {"WZ": "JG"},  # v3: 5-tile charge
                  {"AR": "SN"}, {"NE": "SN"}, {"GH": "WD"}, {"BM": "WD"},
-                 # v5: new troops + the newly swappable classic slots
-                 {"R": "TF"}, {"Q": "SH"}, {"B": "MI"}, {"N": "VA"},
-                 {"Q": "JG"}, {"R": "MI"}, {"N": "SN"}, {"BM": "TF"})
+                 # v5.1: shaman + the newly swappable classic/TF/MI slots
+                 {"Q": "SH"}, {"R": "SH"}, {"N": "VA"},
+                 {"Q": "JG"}, {"N": "SN"}, {"TF": "CT"}, {"MI": "WD"},
+                 {"B": "GO"})
         for shape, n in samples:
             for sw in picks:
                 gs = new_shaped(n, shape, swaps=sw)
@@ -1498,15 +1505,20 @@ class TestShaman(unittest.TestCase):
         clear_keep_kings(self.gs)
         self.gs.turn_pid = 0
 
-    def test_moves_on_four_dirs_only(self):
+    def test_moves_on_ten_dirs_never_sideways(self):
+        # v5.1 buff: the 4 non-sideways ortho steps + the necromancer's 6
+        # diagonal steps.
         gs = self.gs
         gs.board[(0, 0)] = Piece("SH", 0)
         tos = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "move"}
-        self.assertEqual(tos, {(0, 1), (-1, 1), (0, -1), (1, -1)})
+        expected = {(0, 1), (-1, 1), (0, -1), (1, -1)} | set(engine.DIAG)
+        self.assertEqual(tos, expected)
         gs.board[(1, 0)] = Piece("N", 1)    # on a horizontal "side"
-        gs.board[(0, 1)] = Piece("R", 1)    # on a shaman dir
+        gs.board[(0, 1)] = Piece("R", 1)    # on a shaman ortho dir
+        gs.board[(1, 1)] = Piece("B", 1)    # on a shaman diagonal (v5.1)
         tos = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "move"}
         self.assertIn((0, 1), tos)          # capturable
+        self.assertIn((1, 1), tos)          # diagonal capture works too
         self.assertNotIn((1, 0), tos)       # untouchable, ever
         self.assertNotIn((-1, 0), tos)
 
@@ -1592,13 +1604,17 @@ class TestShaman(unittest.TestCase):
         # check — every shaman move here is illegal (it can't help at all)
         self.assertEqual(gs.legal_moves((3, 3)), [])
 
-    def test_shaman_threat_matches_its_four_dirs(self):
+    def test_shaman_threat_matches_its_ten_dirs(self):
         gs = self.gs
         gs.board[(-6, 1)] = Piece("SH", 1)   # (0,1) off K0: a shaman dir
         self.assertTrue(gs.king_in_danger(0))
         self.assertTrue(gs._king_in_danger_scan(0))
         del gs.board[(-6, 1)]
-        gs.board[(-5, 0)] = Piece("SH", 1)   # (1,0): the untouchable side
+        gs.board[(-5, 1)] = Piece("SH", 1)   # (-1,-1) to K0: v5.1 diagonal
+        self.assertTrue(gs.king_in_danger(0))
+        self.assertTrue(gs._king_in_danger_scan(0))
+        del gs.board[(-5, 1)]
+        gs.board[(-5, 0)] = Piece("SH", 1)   # (1,0): still the dead side
         self.assertFalse(gs.king_in_danger(0))
         self.assertFalse(gs._king_in_danger_scan(0))
 
@@ -1743,7 +1759,8 @@ class TestMimic(unittest.TestCase):
         mvs = gs.legal_moves((0, 0))
         self.assertEqual([m for m in mvs if m.kind == "morph"], [])
         self.assertEqual({m.to for m in mvs},
-                         {(0, 1), (-1, 1), (0, -1), (1, -1)})  # shaman steps
+                         {(0, 1), (-1, 1), (0, -1), (1, -1)}
+                         | set(engine.DIAG))   # v5.1 shaman steps
 
     def test_mimic_pawn_honors_moved_flag(self):
         gs = self.gs
@@ -1920,7 +1937,8 @@ class TestFuzz(unittest.TestCase):
         test must keep agreeing with the slow pseudo-move scan (the ground
         truth for mimic/shaman/thief threat), swaps and morphs included."""
         rng = random.Random(52025)
-        swaps = {"R": "TF", "NE": "SH", "B": "MI"}
+        # v5.1: TF/MI are in every base army already; add the shaman via swap
+        swaps = {"NE": "SH", "R": "GO", "B": "VA"}
         kinds_seen = set()
         for n in (2, 3, 6):
             gs = GameState.new_game([(i, "P%d" % i) for i in range(n)],
