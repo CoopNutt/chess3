@@ -307,7 +307,7 @@ PIECE_NAMES = {
 }
 
 PIECE_DESCRIPTIONS = {
-    "K": "One step in any direction. If he goes down, you're out — guard him with your life.",
+    "K": "One step to any of the 6 touching tiles. If he goes down, you're out — guard him with your life.",
     "Q": "Slides as far as she wants, straight or diagonal. Your biggest threat on the board.",
     "R": "Slides any distance in a straight line. An absolute menace on open lanes.",
     "B": "Slides any distance diagonally — and diagonals slip BETWEEN tiles, so nobody can body-block it.",
@@ -744,7 +744,8 @@ class GameState:
         return moves
 
     def _moves_K(self, cell, pc):
-        return self._jumps(cell, pc.owner, _KING_OFFSETS)
+        # kings only step to the 6 touching tiles (no diagonal hops)
+        return self._jumps(cell, pc.owner, tuple(ORTHO))
 
     def _moves_Q(self, cell, pc):
         return self._slide(cell, pc.owner, _KING_OFFSETS)
@@ -1080,9 +1081,11 @@ class GameState:
                     continue
                 if enemy(pc):
                     t = pc.type
+                    # NB: no "K" here — kings only capture on the 6 ortho
+                    # neighbours (see _moves_K)
                     if (t in ("B", "Q")
                             or (t == "DR" and steps <= 3)
-                            or (steps == 1 and t in ("K", "NE", "VA", "WD",
+                            or (steps == 1 and t in ("NE", "VA", "WD",
                                                      "CH"))):
                         return True
                 break

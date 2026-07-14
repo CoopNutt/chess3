@@ -90,7 +90,7 @@ set_theme("Classic")
 
 CFG_PATH = Path.home() / ".chess3.json"
 
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 # Per-troop movement animation profiles.
 #   dur: seconds  |  ease: out / in_expo (accelerate) / steps (fast increments)
