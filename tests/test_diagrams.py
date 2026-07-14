@@ -39,9 +39,9 @@ class TestDiagrams(unittest.TestCase):
     def tearDown(self):
         _reset_style()
 
-    def test_all_21_types_render_non_blank(self):
+    def test_all_24_types_render_non_blank(self):
         """Every type in TYPE_ORDER renders at widths 180 and 240."""
-        self.assertEqual(len(icons.TYPE_ORDER), 21)
+        self.assertEqual(len(icons.TYPE_ORDER), 24)
         for ptype in icons.TYPE_ORDER:
             self.assertIn(ptype, engine.PIECE_NAMES,
                           "engine lacks type %s" % ptype)
@@ -180,9 +180,96 @@ class TestDiagrams(unittest.TestCase):
         self.assertNotIn((2, -2), {m.to for m in moves})
         diagrams.movement_diagram("SK", 240)
 
+    def test_thief_demo_produces_swap_targets(self):
+        """The TF demo (v5) yields swap moves on BOTH the gray enemy pawn
+        and the blue friendly pawn — never a capture — all in-window."""
+        gs = diagrams.demo_state("TF")
+        window = engine.board_cells(diagrams.window_radius("TF"))
+        moves = diagrams.demo_moves("TF")
+        swaps = [m for m in moves if m.kind == "swap"]
+        self.assertGreaterEqual(len(swaps), 2)
+        self.assertTrue(all(m.to in window for m in swaps))
+        targets = {m.to for m in swaps}
+        self.assertIn((2, 0), targets)     # gray enemy pawn
+        self.assertIn((-1, 1), targets)    # blue FRIENDLY pawn
+        for m in swaps:
+            self.assertIn(m.to, gs.board)  # a swap partner always exists
+            self.assertNotEqual(gs.board[m.to].type, "K")
+        # a thief NEVER captures: its plain moves all end on empty cells
+        for m in moves:
+            if m.kind == "move":
+                self.assertNotIn(m.to, gs.board)
+        diagrams.movement_diagram("TF", 240)
+
+    def test_swap_marker_color_exposed_and_painted(self):
+        """SWAP_COLOR is exported, distinct from every other marker color,
+        and actually painted on the TF diagram (the teal double ring)."""
+        self.assertEqual(len(diagrams.SWAP_COLOR), 3)
+        for other in (diagrams.QUIET_COLOR, diagrams.CAPTURE_COLOR,
+                      diagrams.SHOOT_COLOR, diagrams.RAISE_COLOR,
+                      diagrams.HATCH_COLOR):
+            self.assertNotEqual(diagrams.SWAP_COLOR, other)
+        surf = diagrams.movement_diagram("TF", 240)
+        buf = pygame.image.tobytes(surf, "RGB")
+        swap = bytes(diagrams.SWAP_COLOR)
+        idx = buf.find(swap)
+        while idx != -1 and idx % 3 != 0:      # must be pixel-aligned
+            idx = buf.find(swap, idx + 1)
+        self.assertNotEqual(idx, -1,
+                            "no SWAP_COLOR pixel on the TF diagram")
+
+    def test_shaman_demo_four_dirs_no_sideways(self):
+        """The SH demo (v5) shows exactly 4 quiet step dots, and the two
+        horizontal side dirs (1,0)/(-1,0) are NOT among them. Its free
+        morph moves exist in movegen but are never painted as markers."""
+        gs = diagrams.demo_state("SH")
+        window = engine.board_cells(diagrams.window_radius("SH"))
+        moves = diagrams.demo_moves("SH")
+        steps = [m for m in moves if m.kind == "move"]
+        self.assertEqual(len(steps), 4)
+        offs = {m.to for m in steps}
+        self.assertEqual(offs, {(0, 1), (-1, 1), (0, -1), (1, -1)})
+        self.assertNotIn((1, 0), offs)
+        self.assertNotIn((-1, 0), offs)
+        for m in steps:
+            self.assertNotIn(m.to, gs.board)   # quiet dots, not captures
+            self.assertIn(m.to, window)
+        # the 0-soul morphs (P and SK cost 0) are in the movegen...
+        morphs = [m for m in moves if m.kind == "morph"]
+        self.assertEqual({m.arg for m in morphs}, {"P", "SK"})
+        for m in morphs:
+            self.assertEqual(m.from_, (0, 0))
+            self.assertEqual(m.to, (0, 0))
+        # ...but the rendered diagram paints no capture ring anywhere (an
+        # unfiltered morph would drop one on the shaman's own cell)
+        surf = diagrams.movement_diagram("SH", 240)
+        buf = pygame.image.tobytes(surf, "RGB")
+        cap = bytes(diagrams.CAPTURE_COLOR)
+        idx = buf.find(cap)
+        while idx != -1 and idx % 3 != 0:      # must be pixel-aligned
+            idx = buf.find(cap, idx + 1)
+        self.assertEqual(idx, -1,
+                         "capture ring painted on the SH diagram")
+
+    def test_mimic_demo_knight_pattern(self):
+        """The MI demo (v5) pins mimic_type to "N": the diagram is exactly
+        the 12 quiet knight jumps, all inside the window."""
+        gs = diagrams.demo_state("MI")
+        self.assertEqual(gs.mimic_type, "N")
+        window = engine.board_cells(diagrams.window_radius("MI"))
+        moves = diagrams.demo_moves("MI")
+        self.assertEqual(len(moves), 12)
+        self.assertEqual({m.kind for m in moves}, {"move"})
+        self.assertEqual({m.to for m in moves},
+                         {(dq, dr) for dq, dr in engine.KNIGHT})
+        self.assertTrue(all(m.to in window for m in moves))
+        self.assertTrue(all(m.to not in gs.board for m in moves))
+        diagrams.movement_diagram("MI", 240)
+
     def test_markers_match_engine_movegen(self):
         """demo_moves is exactly the engine movegen for the demo state."""
-        for ptype in ("CN", "BM", "GH", "P", "JG", "SN", "WD", "SK"):
+        for ptype in ("CN", "BM", "GH", "P", "JG", "SN", "WD", "SK",
+                      "TF", "SH", "MI"):
             gs = diagrams.demo_state(ptype)
             expected = gs.legal_moves((0, 0))
             got = diagrams.demo_moves(ptype)

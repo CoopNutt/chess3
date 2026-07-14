@@ -9,6 +9,10 @@ of the ray itself.
 
 v2: cells are ALWAYS axial hex cells, but the board OUTLINE varies
 ("hexagon" | "square" | "triangle" | "octagon"); see the shape_* functions.
+
+v5: Move gained an optional `arg` (morph target); MOVE_KINDS gained "swap"
+(thief exchange) and "morph" (shaman transformation); GameState gained
+`mimic_type`, the type the Mimic currently moves and threatens as.
 """
 
 from collections import deque
@@ -115,9 +119,12 @@ OCTAGON_TRIM = 3
 # Board size per (shape, player count), found by scripts/search_layouts.py:
 # at these sizes every start position is QUIET (zero placement displacements
 # and no capture / shoot / instant promotion available to anyone on ply 1)
-# for the DEFAULT army and for every single swap troop (CT/VA/GO/JG/SN/WD)
-# in every swappable slot.  Re-run the search before changing sizes,
-# layouts or shifts.
+# for the DEFAULT army and for every single swap troop in SWAP_TROOPS in
+# every swappable slot.  Re-run the search before changing sizes, layouts
+# or shifts.  v5 note: the expanded matrix (9 troops x 12 slots, incl. the
+# newly swappable R/N/B/Q) re-searched to the SAME sizes — TF never
+# captures, SH is a 1-stepper and MI starts as a pawn-mimic, so v3's
+# 5-tile Juggernaut charge remains the binding stressor.
 SHAPE_SIZE = {
     "hexagon": dict(BOARD_RADIUS),
     "square": {2: 12, 3: 22, 4: 22},
@@ -304,6 +311,7 @@ PIECE_NAMES = {
     "DR": "Dragon", "CH": "Champion", "BM": "Bomber", "GH": "Ghost",
     "NE": "Necromancer", "CT": "Catapult", "VA": "Valkyrie", "GO": "Golem",
     "JG": "Juggernaut", "SN": "Sniper", "WD": "Warden", "SK": "Skeleton",
+    "TF": "Thief", "SH": "Shaman", "MI": "Mimic",
 }
 
 PIECE_DESCRIPTIONS = {
@@ -328,17 +336,38 @@ PIECE_DESCRIPTIONS = {
     "SN": "Sidles 1 diagonal tile, but headshots enemies exactly 2 diagonal tiles out — without moving, straight over anyone's head. Golems just shrug it off.",
     "WD": "Walks 1 tile any direction, like a King. Friends standing right beside it (straight-adjacent) can't be taken by normal moves — though shots and explosions still get through, and nobody guards the guard itself.",
     "SK": "A pawn back from the dead — shuffles forward, stabs on the forward diagonals, and strolls right over graveyard tiles. The glue only holds for 3 moves, then it crumbles. Never promotes.",
+    "TF": "Slides straight like a Rook but never hurts anyone. Instead it SWAPS places with the first piece within 3 straight tiles — friend or enemy, your pick. Kings are off-limits, and nobody ever fears a Thief.",
+    "SH": "Steps 1 tile straight — any way except dead sideways. Every kill feeds it a SOUL; spend souls to permanently morph into almost any other piece. Pawns are free, a Queen runs you 5.",
+    "MI": "A perfect copycat: it moves exactly like the LAST piece anyone moved. Rook slid? It's a rook now. Archer sniped? It snipes. New personality every single turn.",
 }
 
 # "grave" never comes out of movegen — it is the wire/UI pseudo-kind for a
 # dead player cursing a tile (see apply_grave); Move.from_dict accepts it.
-MOVE_KINDS = ("move", "shoot", "raise", "grave")
+# v5 adds "swap" (thief exchange) and "morph" (shaman transformation).
+MOVE_KINDS = ("move", "shoot", "raise", "swap", "morph", "grave")
 
-# Swappable troops (v2 added CT/VA/GO, v3 added JG/SN/WD): `swaps` maps a
-# DEFAULT troop type to its replacement, e.g. {"CN": "CT", "GH": "VA"};
-# each replacement may be used at most once.
-SWAP_TROOPS = ("CT", "VA", "GO", "JG", "SN", "WD")
-SWAPPABLE_TYPES = ("CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE")
+# Swappable troops (v2 added CT/VA/GO, v3 JG/SN/WD, v5 TF/SH/MI): `swaps`
+# maps a DEFAULT troop type to its replacement, e.g. {"CN": "CT", "R": "TF"};
+# each replacement may be used at most once.  v5: the classic R/N/B/Q became
+# swappable too — swapping one replaces ALL pieces of that type in every
+# army (both rooks / both knights).  "P" and "K" stay unswappable.
+SWAP_TROOPS = ("CT", "VA", "GO", "JG", "SN", "WD", "TF", "SH", "MI")
+SWAPPABLE_TYPES = ("CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE",
+                   "R", "N", "B", "Q")
+
+# v5: max ortho steps between a Thief and its swap partner.
+THIEF_RANGE = 3
+
+# v5: soul price a Shaman pays to permanently become each type.  "K" and
+# "SH" are never morphable (absent on purpose).  Movegen emits one morph
+# move per affordable type; the leftover souls stay in Piece.uses.
+MORPH_COSTS = {
+    "P": 0, "SK": 0,
+    "N": 2, "R": 2, "B": 2, "CN": 2, "AR": 2, "SN": 2, "TF": 2,
+    "CH": 3, "VA": 3, "GH": 3, "NE": 3, "GO": 3, "CT": 3, "BM": 3, "MI": 3,
+    "JG": 4, "DR": 4, "WZ": 4,
+    "Q": 5, "WD": 5,
+}
 
 # Home rows of an army, nearest the edge first (24 pieces total).
 # The pawns form a STAGGERED double shield (rows 2+3): hex diagonals hop
@@ -391,6 +420,11 @@ _WZ_OFFSETS = tuple(sorted(
     (dq, dr)
     for dq in range(-2, 3) for dr in range(-2, 3)
     if 1 <= (abs(dq) + abs(dr) + abs(dq + dr)) // 2 <= 2))
+# v5 Shaman: the 4 ortho dirs excluding the two horizontal "sides"
+# (1,0)/(-1,0).  The set is symmetric under negation, which the reverse
+# attack test in _cell_attacked relies on.
+_SH_DIRS = ((0, 1), (-1, 1), (0, -1), (1, -1))
+_SH_DIR_SET = frozenset(_SH_DIRS)
 
 
 class Piece:
@@ -416,31 +450,44 @@ class Piece:
 class Move:
     """A move order with value semantics; kind is one of MOVE_KINDS.
 
-    Movegen only ever produces "move" / "shoot" / "raise"; "grave" exists
-    so the dead-player tile-curse can ride the same wire format (net/UI).
+    Movegen only ever produces "move" / "shoot" / "raise" / "swap" /
+    "morph"; "grave" exists so the dead-player tile-curse can ride the
+    same wire format (net/UI).  `arg` (v5, string|None) carries the morph
+    target type; it serializes only when set.
     """
 
-    __slots__ = ("from_", "to", "kind")
+    __slots__ = ("from_", "to", "kind", "arg")
 
-    def __init__(self, from_, to, kind="move"):
+    def __init__(self, from_, to, kind="move", arg=None):
         self.from_ = (int(from_[0]), int(from_[1]))
         self.to = (int(to[0]), int(to[1]))
         self.kind = kind
+        self.arg = arg
 
     def to_dict(self):
-        """JSON-safe dict form: {"from":[q,r], "to":[q,r], "kind":...}."""
-        return {"from": [self.from_[0], self.from_[1]],
-                "to": [self.to[0], self.to[1]],
-                "kind": self.kind}
+        """JSON-safe dict form: {"from":[q,r], "to":[q,r], "kind":...};
+        includes "arg" ONLY when it is set."""
+        d = {"from": [self.from_[0], self.from_[1]],
+             "to": [self.to[0], self.to[1]],
+             "kind": self.kind}
+        if self.arg is not None:
+            d["arg"] = self.arg
+        return d
 
     @staticmethod
     def from_dict(d):
-        """Build a Move from its dict form; raises ValueError if malformed."""
+        """Build a Move from its dict form; raises ValueError if malformed.
+
+        Accepts both pre-v5 dicts (no "arg" key) and v5 ones.
+        """
         if not isinstance(d, dict):
             raise ValueError("move must be a dict")
         kind = d.get("kind", "move")
         if kind not in MOVE_KINDS:
             raise ValueError("bad move kind: %r" % (kind,))
+        arg = d.get("arg")
+        if arg is not None and not isinstance(arg, str):
+            raise ValueError("bad move arg: %r" % (arg,))
         cells = []
         for key in ("from", "to"):
             v = d.get(key)
@@ -449,20 +496,24 @@ class Move:
                             for x in v)):
                 raise ValueError("bad move field %r: %r" % (key, v))
             cells.append((v[0], v[1]))
-        return Move(cells[0], cells[1], kind)
+        return Move(cells[0], cells[1], kind, arg)
 
     def __eq__(self, other):
         return (isinstance(other, Move) and self.from_ == other.from_
-                and self.to == other.to and self.kind == other.kind)
+                and self.to == other.to and self.kind == other.kind
+                and self.arg == other.arg)
 
     def __ne__(self, other):
         return not self.__eq__(other)
 
     def __hash__(self):
-        return hash((self.from_, self.to, self.kind))
+        return hash((self.from_, self.to, self.kind, self.arg))
 
     def __repr__(self):
-        return "Move(%r, %r, %r)" % (self.from_, self.to, self.kind)
+        if self.arg is None:
+            return "Move(%r, %r, %r)" % (self.from_, self.to, self.kind)
+        return "Move(%r, %r, %r, %r)" % (self.from_, self.to, self.kind,
+                                         self.arg)
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +534,7 @@ class GameState:
         self.log = []          # human-readable event lines (last 200)
         self.graveyards = set()   # cursed cells (see apply_grave)
         self.graves_left = {}     # pid -> curses remaining (granted on death)
+        self.mimic_type = "P"     # v5: what Mimics move as (last acted type)
         self._cells = _shape_cells_frozen(shape, radius)
         self._boom = deque()       # pending explosion centers
         self._dead_kings = []      # owners whose king died this resolution
@@ -673,6 +725,22 @@ class GameState:
             elif move.kind == "raise":
                 board[move.to] = Piece("SK", pid, True)
                 added.append(move.to)
+            elif move.kind == "swap":
+                # v5: simulate BOTH pieces exchanging — a swap can pull
+                # your own blocker off a line (or hand an enemy slider a
+                # cell it attacks your king from).
+                a = board.pop(move.from_)
+                b = board.pop(move.to)
+                removed[move.from_] = a
+                removed[move.to] = b
+                board[move.from_] = b
+                board[move.to] = a
+                added.extend((move.from_, move.to))
+            elif move.kind == "morph":
+                # v5: nothing changes positionally — a morph is exposed
+                # iff the king is attacked right now (it never resolves
+                # a check).
+                pass
             else:  # "move"
                 mover = board.get(move.from_)
                 if mover is None:
@@ -966,13 +1034,62 @@ class GameState:
         # move-capture generator.)
         return self._jumps(cell, pc.owner, _KING_OFFSETS)
 
+    def _moves_TF(self, cell, pc):
+        # Thief (v5): slides along ortho rays like a rook but can NEVER
+        # capture.  Instead, kind="swap": along each ray, if the FIRST
+        # piece within THIEF_RANGE steps (empties between) is anything but
+        # a King — either side's — the thief may exchange cells with it.
+        # Swaps are not captures: warden auras ignore them, nothing dies,
+        # no souls are gained.  Graveyard cells wall the ray off as usual.
+        moves = self._slide(cell, pc.owner, ORTHO, capture=False)
+        for dq, dr in ORTHO:
+            q, r = cell
+            for _ in range(THIEF_RANGE):
+                q += dq
+                r += dr
+                if (q, r) not in self._cells or (q, r) in self.graveyards:
+                    break
+                occ = self.board.get((q, r))
+                if occ is None:
+                    continue
+                if occ.type != "K":
+                    moves.append(Move(cell, (q, r), "swap"))
+                break
+        return moves
+
+    def _moves_SH(self, cell, pc):
+        # Shaman (v5): steps 1 cell along the 4 ortho dirs that aren't the
+        # two horizontal "sides", moving or capturing.  Its `uses` field is
+        # the SOUL counter (+1 whenever the shaman itself captures); a
+        # morph move (from_ == to == its cell, arg = target type) spends
+        # souls to permanently become that type.  Never morphs to K or SH.
+        moves = self._jumps(cell, pc.owner, _SH_DIRS)
+        for t, cost in MORPH_COSTS.items():
+            if cost <= pc.uses:
+                moves.append(Move(cell, cell, "morph", t))
+        return moves
+
+    def _moves_MI(self, cell, pc):
+        # Mimic (v5): moves exactly like the LAST piece that acted in the
+        # game (gs.mimic_type), via a stand-in piece of that type carrying
+        # the mimic's own owner/moved/uses.  Morph moves are dropped (a
+        # mimic has no souls worth spending); shoots, swaps and raises are
+        # copied faithfully.
+        mt = self.mimic_type
+        if mt == "MI" or mt not in self._GEN:
+            mt = "P"   # defensive: mimics never copy mimics
+        stand_in = Piece(mt, pc.owner, pc.moved, pc.uses)
+        return [m for m in self._GEN[mt](self, cell, stand_in)
+                if m.kind != "morph"]
+
     _GEN = {"K": _moves_K, "Q": _moves_Q, "R": _moves_R, "B": _moves_B,
             "N": _moves_N, "P": _moves_P, "CN": _moves_CN, "AR": _moves_AR,
             "WZ": _moves_WZ, "DR": _moves_DR, "CH": _moves_CH,
             "BM": _moves_BM, "GH": _moves_GH, "NE": _moves_NE,
             "CT": _moves_CT, "VA": _moves_VA, "GO": _moves_GO,
             "JG": _moves_JG, "SN": _moves_SN, "WD": _moves_WD,
-            "SK": _moves_SK}
+            "SK": _moves_SK, "TF": _moves_TF, "SH": _moves_SH,
+            "MI": _moves_MI}
 
     # -- attacks ------------------------------------------------------------
 
@@ -981,6 +1098,16 @@ class GameState:
             if pc.owner == pid and pc.type == "K":
                 return c
         return None
+
+    def _eff_type(self, pc):
+        """The type `pc` moves and THREATENS as (v5): a Mimic borrows the
+        last-acted type (gs.mimic_type); everyone else is just themselves.
+        A pawn-mimic threatens by its OWNER's seat, which falls out
+        naturally because the owner never changes."""
+        if pc.type == "MI":
+            mt = self.mimic_type
+            return "P" if mt == "MI" else mt
+        return pc.type
 
     def king_in_danger(self, pid):
         """True if any living enemy piece can capture pid's king right now."""
@@ -997,7 +1124,10 @@ class GameState:
             if pc.owner == pid or not self._is_alive(pc.owner):
                 continue
             for mv in self._pseudo_moves(c):
-                if mv.to == kcell and mv.kind != "raise":
+                # only "move" and "shoot" are capture-capable kinds; a
+                # thief's swap never targets a king anyway (v5), raises
+                # target empty cells, morphs target the actor's own cell
+                if mv.to == kcell and mv.kind in ("move", "shoot"):
                     return True
         return False
 
@@ -1005,10 +1135,17 @@ class GameState:
         """Fast reverse attack test: can any living enemy capture a `pid`
         piece standing on `kcell`? Mirrors every piece's movement rules from
         the target's point of view (differentially tested against the pseudo
-        move scan in the fuzz suite)."""
+        move scan in the fuzz suite).
+
+        v5: every type comparison goes through _eff_type so a Mimic
+        threatens as whatever mimic_type currently is; a Thief (or a
+        thief-mimic) never attacks anything; a Shaman attacks at 1 step on
+        its 4 dirs only.
+        """
         board = self.board
         cells = self._cells
         graves = self.graveyards
+        eff = self._eff_type
 
         def enemy(pc):
             return (pc is not None and pc.owner != pid
@@ -1020,14 +1157,14 @@ class GameState:
         # --- ranged shots ignore blockers AND the aura ---
         for dq, dr in ORTHO:
             pc = board.get((kcell[0] + 2 * dq, kcell[1] + 2 * dr))
-            if enemy(pc) and pc.type == "AR":
+            if enemy(pc) and eff(pc) == "AR":
                 return True
             pc = board.get((kcell[0] + 3 * dq, kcell[1] + 3 * dr))
-            if enemy(pc) and pc.type == "CT":
+            if enemy(pc) and eff(pc) == "CT":
                 return True
         for dq, dr in DIAG:
             pc = board.get((kcell[0] + 2 * dq, kcell[1] + 2 * dr))
-            if enemy(pc) and pc.type == "SN":
+            if enemy(pc) and eff(pc) == "SN":
                 return True
         if shielded:
             return False
@@ -1050,18 +1187,23 @@ class GameState:
                     continue
                 if not seen_screen:
                     if enemy(pc):
-                        t = pc.type
+                        t = eff(pc)
+                        # NB: no "TF" anywhere — thieves never attack (v5).
+                        # The shaman's dir test works unsigned because
+                        # _SH_DIRS is symmetric under negation.
                         if (t in ("R", "Q")
                                 or (t == "DR" and steps <= 3)
                                 or (t == "JG" and steps <= jg_range)
                                 or (t == "BM" and steps <= 2)
                                 or (steps == 1 and t in ("K", "GO", "WD",
-                                                         "CH"))):
+                                                         "CH"))
+                                or (steps == 1 and t == "SH"
+                                    and (dq, dr) in _SH_DIR_SET)):
                             return True
                     seen_screen = True
                 else:
                     # second piece on the ray: only a cannon jumps the screen
-                    if enemy(pc) and pc.type == "CN":
+                    if enemy(pc) and eff(pc) == "CN":
                         return True
                     break
 
@@ -1080,7 +1222,7 @@ class GameState:
                 if pc is None:
                     continue
                 if enemy(pc):
-                    t = pc.type
+                    t = eff(pc)
                     # NB: no "K" here — kings only capture on the 6 ortho
                     # neighbours (see _moves_K)
                     if (t in ("B", "Q")
@@ -1093,25 +1235,27 @@ class GameState:
         # --- jumps that ignore blockers ---
         for dq, dr in KNIGHT:
             pc = board.get((kcell[0] + dq, kcell[1] + dr))
-            if enemy(pc) and pc.type in ("N", "VA"):
+            if enemy(pc) and eff(pc) in ("N", "VA"):
                 return True
         for dq, dr in ORTHO:  # champion's 2-step ortho leap
             pc = board.get((kcell[0] + 2 * dq, kcell[1] + 2 * dr))
-            if enemy(pc) and pc.type == "CH":
+            if enemy(pc) and eff(pc) == "CH":
                 return True
         for dq, dr in DIAG:   # ghosts phase through anything within range
             for k in range(1, GHOST_RANGE + 1):
                 pc = board.get((kcell[0] + k * dq, kcell[1] + k * dr))
-                if enemy(pc) and pc.type == "GH":
+                if enemy(pc) and eff(pc) == "GH":
                     return True
         for dq in range(-2, 3):  # wizard teleports within 2
             for dr in range(-2, 3):
                 if 1 <= (abs(dq) + abs(dr) + abs(dq + dr)) // 2 <= 2:
                     pc = board.get((kcell[0] + dq, kcell[1] + dr))
-                    if enemy(pc) and pc.type == "WZ":
+                    if enemy(pc) and eff(pc) == "WZ":
                         return True
 
         # --- pawns and skeletons: their 3 forward capture diagonals ---
+        # (a pawn-mimic threatens by its OWNER's seat: the owner drives
+        # which player's forwards apply)
         for p in self.players:
             if p["pid"] == pid or not p["alive"]:
                 continue
@@ -1121,7 +1265,7 @@ class GameState:
                         (2 * f2[0] - f1[0], 2 * f2[1] - f1[1])):
                 pc = board.get((kcell[0] - cap[0], kcell[1] - cap[1]))
                 if (pc is not None and pc.owner == p["pid"]
-                        and pc.type in ("P", "SK")):
+                        and eff(pc) in ("P", "SK")):
                     return True
         return False
 
@@ -1147,6 +1291,7 @@ class GameState:
         self._boom = deque()
         self._dead_kings = []
         name = self._name(pid)
+        actor_type = pc.type   # v5: the mimic copies the type at move START
 
         if move.kind == "raise":
             # v4: raising consumes a lost Pawn but yields a Skeleton.
@@ -1154,6 +1299,25 @@ class GameState:
             self.board[move.to] = Piece("SK", pid, True)
             self._log("%s's Necromancer raises a Skeleton from the dead!"
                       % name)
+        elif move.kind == "swap":
+            # v5 thief swap: the two pieces exchange cells; nothing dies,
+            # no souls are gained.  The thief is marked moved; the OTHER
+            # piece keeps its own flags untouched.
+            other = self.board[move.to]
+            self.board[move.to] = pc
+            self.board[move.from_] = other
+            pc.moved = True
+            self._log("%s's %s swaps places with %s's %s." %
+                      (name, PIECE_NAMES[pc.type],
+                       self._name(other.owner), PIECE_NAMES[other.type]))
+        elif move.kind == "morph":
+            # v5 shaman morph: spend souls to permanently become move.arg;
+            # nothing changes positionally, but the turn is consumed and
+            # the leftover souls stay in `uses`.
+            pc.uses -= MORPH_COSTS[move.arg]
+            pc.type = move.arg
+            self._log("%s's Shaman twists into a %s!"
+                      % (name, PIECE_NAMES[move.arg]))
         elif move.kind == "shoot":
             victim = self.board[move.to]
             self._log("%s's %s shoots %s's %s!" %
@@ -1173,7 +1337,13 @@ class GameState:
             # quiet moves are not logged — the board highlight shows them
             del self.board[move.from_]
             pc.moved = True
-            pc.uses += 1              # v4: completed moves (SK / BM care)
+            if pc.type == "SH":
+                # v5: a shaman's `uses` are SOULS — they grow only when
+                # the shaman itself captures, never on quiet moves.
+                if victim is not None:
+                    pc.uses += 1
+            else:
+                pc.uses += 1          # v4: completed moves (SK / BM care)
             self.board[move.to] = pc
             if victim is not None and pc.type == "BM":
                 # A bomber that captures explodes on its landing cell and
@@ -1195,6 +1365,13 @@ class GameState:
                 self._log("%s's Bomber's fuse runs out!" % name)
                 self._kill(move.to)
                 self._resolve_explosions()
+
+        # v5: the Mimic copies the LAST action — but never another Mimic.
+        # move/shoot record the actor's type at move start; swap, raise and
+        # morph record the piece that owns the trick (TF / NE / SH).
+        if actor_type != "MI":
+            self.mimic_type = {"swap": "TF", "raise": "NE",
+                               "morph": "SH"}.get(move.kind, actor_type)
 
         for owner in self._dead_kings:
             if self._is_alive(owner):
@@ -1370,6 +1547,7 @@ class GameState:
             "graveyards": [[q, r] for q, r in sorted(self.graveyards)],
             "graves_left": {str(pid): int(n)
                             for pid, n in self.graves_left.items()},
+            "mimic": self.mimic_type,
         }
 
     @staticmethod
@@ -1378,7 +1556,8 @@ class GameState:
 
         Back-compat: v1 dicts have no "shape" key (default "hexagon");
         pre-v4 dicts have 5-element board rows (uses defaults to 0) and no
-        "graveyards" / "graves_left" keys (default empty).
+        "graveyards" / "graves_left" keys (default empty); pre-v5 dicts
+        have no "mimic" key (default "P").
         """
         gs = GameState(int(d["radius"]), str(d.get("shape", "hexagon")))
         gs.players = [{"pid": int(p["pid"]), "name": str(p["name"]),
@@ -1402,4 +1581,5 @@ class GameState:
                          for q, r in d.get("graveyards", [])}
         gs.graves_left = {int(pid): int(n)
                           for pid, n in d.get("graves_left", {}).items()}
+        gs.mimic_type = str(d.get("mimic", "P"))
         return gs

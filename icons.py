@@ -19,6 +19,10 @@ graveyard tiles, and ``draw_cracks`` for deterministic cracked-tile
 overlays (seeded purely from the cell coords so every client draws the
 exact same cracks — the global ``random`` state is never touched).
 
+V5 adds the three swap-troop glyphs (24 types): TF Thief (domino mask
+over a grabbing hand), SH Shaman (feathered tribal mask with a small
+soul flame) and MI Mimic (an open-lidded, fanged mimic chest).
+
 This is one of the only two modules allowed to import pygame (with main.py).
 """
 
@@ -80,11 +84,13 @@ PLAYER_COLORS = [
     (158, 84, 214),
 ]
 
-# Canonical display order of the 21 piece types (v2 adds CT, VA, GO;
-# v3 adds JG, SN, WD; v4 adds SK — the necromancer-raised skeleton).
+# Canonical display order of the 24 piece types (v2 adds CT, VA, GO;
+# v3 adds JG, SN, WD; v4 adds SK — the necromancer-raised skeleton;
+# v5 adds TF, SH, MI — the swap troops thief, shaman and mimic).
 TYPE_ORDER = ["K", "Q", "R", "B", "N", "P",
               "CN", "AR", "WZ", "DR", "CH", "BM", "GH", "NE",
-              "CT", "VA", "GO", "JG", "SN", "WD", "SK"]
+              "CT", "VA", "GO", "JG", "SN", "WD", "SK",
+              "TF", "SH", "MI"]
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +507,84 @@ def _g_skeleton(surf, cx, cy, s, ow):
     _ink_disc(surf, cx, cy, s, 0.13, -0.56, 0.08)
 
 
+def _g_thief(surf, cx, cy, s, ow):
+    """Domino mask over a grabbing hand hint: the no-kill swap burglar."""
+    # tie strings out to the sides
+    _ink_line(surf, cx, cy, s, (-0.80, -0.30), (-0.97, -0.16), max(1, ow))
+    _ink_line(surf, cx, cy, s, (0.80, -0.30), (0.97, -0.16), max(1, ow))
+    # domino mask: peaks over the eyes, dipped nose bridge
+    mask = [(-0.82, -0.30), (-0.62, -0.54), (-0.26, -0.56), (0.0, -0.42),
+            (0.26, -0.56), (0.62, -0.54), (0.82, -0.30), (0.52, -0.10),
+            (0.18, -0.16), (0.0, -0.28), (-0.18, -0.16), (-0.52, -0.10)]
+    _poly(surf, cx, cy, s, mask, ow=ow)
+    # slanted eye holes
+    _ink_poly(surf, cx, cy, s,
+              [(-0.56, -0.40), (-0.26, -0.44), (-0.30, -0.26),
+               (-0.52, -0.24)])
+    _ink_poly(surf, cx, cy, s,
+              [(0.26, -0.44), (0.56, -0.40), (0.52, -0.24), (0.30, -0.26)])
+    # grabbing hand: palm, four hooked fingers with knuckle tips, a thumb
+    _disc(surf, cx, cy, s, 0.02, 0.46, 0.24, ow=ow)
+    for i, x in enumerate((-0.24, -0.06, 0.12, 0.30)):
+        tip_y = 0.06 if i in (1, 2) else 0.12   # middle fingers reach higher
+        _stick(surf, cx, cy, s, (x, 0.36), (x - 0.02, tip_y), 0.10, ow=ow)
+        _disc(surf, cx, cy, s, x - 0.09, tip_y - 0.02, 0.07, ow=ow)
+    _stick(surf, cx, cy, s, (0.20, 0.56), (0.44, 0.40), 0.10, ow=ow)
+
+
+def _g_shaman(surf, cx, cy, s, ow):
+    """Feathered tribal mask (horn fan + paint stripes) + small soul flame."""
+    # feather/horn fan radiating from behind the mask crown
+    for k in range(5):
+        ang = math.radians(-150 + k * 30)
+        bx, by = 0.0, -0.20
+        tipx = bx + 0.92 * math.cos(ang)
+        tipy = by + 0.92 * math.sin(ang)
+        px, py = -math.sin(ang) * 0.10, math.cos(ang) * 0.10
+        _poly(surf, cx, cy, s,
+              [(bx + px, by + py), (bx - px, by - py), (tipx, tipy)], ow=ow)
+    # tapered mask face
+    face = [(-0.40, -0.44), (0.40, -0.44), (0.46, 0.04), (0.20, 0.56),
+            (-0.20, 0.56), (-0.46, 0.04)]
+    _poly(surf, cx, cy, s, face, ow=ow)
+    # hollow eyes, chin paint stripe, mouth slit
+    _ink_disc(surf, cx, cy, s, -0.18, -0.14, 0.08)
+    _ink_disc(surf, cx, cy, s, 0.18, -0.14, 0.08)
+    _ink_line(surf, cx, cy, s, (0.0, 0.04), (0.0, 0.26), max(1, ow))
+    _ink_line(surf, cx, cy, s, (-0.12, 0.38), (0.12, 0.38), max(1, ow))
+    # small soul flame flickering at the lower right
+    flame = [(0.62, 0.16), (0.76, 0.38), (0.70, 0.60), (0.52, 0.62),
+             (0.46, 0.42), (0.56, 0.34)]
+    _poly(surf, cx, cy, s, flame, ow=ow)
+    _ink_disc(surf, cx, cy, s, 0.61, 0.48, 0.06)
+
+
+def _g_mimic(surf, cx, cy, s, ow):
+    """Classic mimic chest: raised lid, dark maw, two rows of fangs."""
+    # dark maw gaping between lid and chest
+    _ink_poly(surf, cx, cy, s,
+              [(-0.64, -0.36), (0.64, -0.36), (0.58, 0.16), (-0.58, 0.16)])
+    # raised lid with a band line
+    _poly(surf, cx, cy, s,
+          [(-0.72, -0.36), (0.72, -0.36), (0.60, -0.74), (-0.60, -0.74)],
+          ow=ow)
+    _ink_line(surf, cx, cy, s, (-0.63, -0.55), (0.63, -0.55), max(1, ow))
+    # upper fangs hanging from the lid
+    for x in (-0.45, -0.15, 0.15, 0.45):
+        _poly(surf, cx, cy, s,
+              [(x - 0.10, -0.36), (x + 0.10, -0.36), (x, -0.10)], ow=ow)
+    # chest body
+    _poly(surf, cx, cy, s,
+          [(-0.62, 0.14), (0.62, 0.14), (0.62, 0.64), (-0.62, 0.64)], ow=ow)
+    # lower fangs biting upward, interleaved with the upper row
+    for x in (-0.30, 0.0, 0.30):
+        _poly(surf, cx, cy, s,
+              [(x - 0.10, 0.16), (x + 0.10, 0.16), (x, -0.10)], ow=ow)
+    # keyhole on the lock plate
+    _ink_disc(surf, cx, cy, s, 0.0, 0.36, 0.07)
+    _ink_line(surf, cx, cy, s, (0.0, 0.38), (0.0, 0.52), max(1, ow + 1))
+
+
 _GLYPHS = {
     "K": _g_king,
     "Q": _g_queen,
@@ -523,6 +607,9 @@ _GLYPHS = {
     "SN": _g_sniper,
     "WD": _g_warden,
     "SK": _g_skeleton,
+    "TF": _g_thief,
+    "SH": _g_shaman,
+    "MI": _g_mimic,
 }
 
 
@@ -545,7 +632,7 @@ def draw_piece(surface, ptype, body_color, size, center):
 
     Args:
         surface: any pygame.Surface (no display required).
-        ptype: one of the 21 type ids ("K", "Q", ..., "SN", "WD", "SK").
+        ptype: one of the 24 type ids ("K", "Q", ..., "TF", "SH", "MI").
         body_color: (r, g, b) body color, e.g. an entry of PLAYER_COLORS.
         size: target diameter in pixels (glyphs stay readable down to ~24).
         center: (x, y) pixel center of the piece.
@@ -589,14 +676,14 @@ def draw_piece(surface, ptype, body_color, size, center):
 
 
 def render_all_preview(cell=48):
-    """Render a grid of all 21 piece types in all 6 player colors.
+    """Render a grid of all 24 piece types in all 6 player colors.
 
-    Columns are the 21 types in TYPE_ORDER; rows are the 6 PLAYER_COLORS.
+    Columns are the 24 types in TYPE_ORDER; rows are the 6 PLAYER_COLORS.
     Cells alternate dark/light backgrounds so glyph readability can be
     checked on both. Used by the help screen and for manual eyeballing.
 
     Returns:
-        A pygame.Surface of size (21 * cell, 6 * cell).
+        A pygame.Surface of size (24 * cell, 6 * cell).
     """
     cols = len(TYPE_ORDER)
     rows = len(PLAYER_COLORS)

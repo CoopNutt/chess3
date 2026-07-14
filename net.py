@@ -20,6 +20,11 @@ engine.apply_grave (HostServer.submit_host_grave for the host,
 NetClient.send_grave for joiners); GitHub release-check helpers
 (get_latest_release / download_file) for the in-app updater; protocol
 version bumped to 4 (Skeletons + graveyards cross the wire).
+
+v5: protocol version bumped to 5 (Thief/Shaman/Mimic plus Move.arg and the
+"swap"/"morph" kinds cross the wire; swappable slots now include R/N/B/Q).
+No new messages: swap validation simply follows the widened engine tables
+and moves carry the optional "arg" field transparently.
 """
 import json
 import math
@@ -37,7 +42,7 @@ from urllib.parse import urljoin
 import engine
 
 DEFAULT_PORT = 47733
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_PLAYERS = 6
 MIN_PLAYERS = 2
 _MAX_LINE = 64 * 1024

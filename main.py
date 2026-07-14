@@ -90,7 +90,7 @@ set_theme("Classic")
 
 CFG_PATH = Path.home() / ".chess3.json"
 
-VERSION = "4.1.1"
+VERSION = "4.2.0"
 
 # Per-troop movement animation profiles.
 #   dur: seconds  |  ease: out / in_expo (accelerate) / steps (fast increments)
@@ -121,17 +121,23 @@ ANIM_PROFILES = {
     "SN": dict(dur=0.10, ease="out"),
     "WD": dict(dur=0.24, ease="out"),
     "SK": dict(dur=0.50, ease="out", trail=True),
+    "TF": dict(dur=0.12, ease="out", afterimages=True, snd="whoosh"),
+    "SH": dict(dur=0.42, ease="out"),
+    "MI": dict(dur=0.24, ease="out"),
 }
 
 SHAPE_CYCLE = ["hexagon", "square", "triangle", "octagon"]
 MOVE_TIMER_OPTS = [0, 15, 30, 60, 120]
 TOTAL_TIMER_OPTS = [0, 5, 10, 20, 30]
-SWAP_TROOPS = ["CT", "VA", "GO", "JG", "SN", "WD"]
+SWAP_TROOPS = ["CT", "VA", "GO", "JG", "SN", "WD", "TF", "SH", "MI"]
 SWAP_SHORT = {"CT": "Catapult", "VA": "Valkyrie", "GO": "Golem",
               "JG": "Jugger", "SN": "Sniper", "WD": "Warden",
+              "TF": "Thief", "SH": "Shaman", "MI": "Mimic",
               "CN": "Cannon", "AR": "Archer", "WZ": "Wizard", "CH": "Champ",
-              "BM": "Bomber", "GH": "Ghost", "NE": "Necro", "DR": "Dragon"}
-SWAP_TARGETS = [None, "CN", "AR", "WZ", "CH", "BM", "GH", "NE", "DR"]
+              "BM": "Bomber", "GH": "Ghost", "NE": "Necro", "DR": "Dragon",
+              "R": "Rook", "N": "Knight", "B": "Bishop", "Q": "Queen"}
+SWAP_TARGETS = [None, "CN", "AR", "WZ", "CH", "BM", "GH", "NE", "DR",
+                "R", "N", "B", "Q"]
 
 _fonts = {}
 
@@ -327,6 +333,10 @@ class BoardView:
         self.marks = set()          # right-clicked highlight tiles
         self.arrow_anchor = None    # right-drag in progress
         self.protect_cells = set()  # friendlies guarded by the selection
+        self.view_rot = 0           # extra board rotation (rotate button)
+        self._me_seat = 0
+        self.anim_hide = set()      # cells hidden while a swap animates
+        self.morphs = []            # shaman morph moves (soul shop)
         self._t2d = {}           # true cell -> display cell (orientation)
         self._d2t = {}
 
@@ -341,10 +351,8 @@ class BoardView:
         self.cells = engine.shape_cells(self.shape, self.size)
         self.my_pid = my_pid
         me = next((p for p in self.state.players if p["pid"] == my_pid), None)
-        seat = me["seat"] if me else 0
-        self._t2d = {c: engine.shape_orient(self.shape, c, seat, self.size)
-                     for c in self.cells}
-        self._d2t = {d: c for c, d in self._t2d.items()}
+        self._me_seat = me["seat"] if me else 0
+        self._rebuild_orient()
         self._compute_edge_cells(me)
         last = sd.get("_last_move")
         if last and last.get("move"):
@@ -377,9 +385,13 @@ class BoardView:
             return
         self.selected = cell
         try:
-            self.legal = {mv.to: mv for mv in self.state.legal_moves(cell)}
+            all_mv = self.state.legal_moves(cell)
         except Exception:
-            self.legal = {}
+            all_mv = []
+        # morphs all share to==from — they live in the soul shop, not on
+        # the board
+        self.morphs = [mv for mv in all_mv if mv.kind == "morph"]
+        self.legal = {mv.to: mv for mv in all_mv if mv.kind != "morph"}
         self.legal_clickable = (pc.owner == self.my_pid and self.my_turn())
         gs = self.state
         self.danger_cells = {to for to, mv in self.legal.items()
@@ -437,6 +449,42 @@ class BoardView:
         self.arrows = []
         self.marks = set()
         self.arrow_anchor = None
+
+    def view_steps(self):
+        """How many distinct view rotations this board shape supports."""
+        return {"square": 4, "triangle": 3}.get(self.shape, 6)
+
+    def _view_xform(self, cell):
+        """Extra display rotation applied on top of the seat orientation."""
+        k = self.view_rot % self.view_steps()
+        if k == 0:
+            return cell
+        if self.shape == "square":
+            s = self.size
+            q, r = cell
+            if k in (1, 3):
+                q, r = r, q                     # mirror across the long axis
+            if k >= 2:
+                q, r = s - 1 - q, s - 1 - r     # 180 point-reflection
+            return (q, r)
+        if self.shape == "triangle":
+            t = self.size
+            q, r = cell
+            for _ in range(k):                  # 120-degree rotation
+                q, r = t - q - r, q
+            return (q, r)
+        return engine.rotate60(cell, k)         # hexagon / octagon: 60 deg
+
+    def _rebuild_orient(self):
+        self._t2d = {c: self._view_xform(
+            engine.shape_orient(self.shape, c, self._me_seat, self.size))
+            for c in self.cells}
+        self._d2t = {d: c for c, d in self._t2d.items()}
+
+    def rotate_view(self, direction=1):
+        self.view_rot = (self.view_rot + direction) % self.view_steps()
+        self._rebuild_orient()
+        self._layout()
 
     def _compute_edge_cells(self, me):
         self.my_edge_cells = set()
@@ -539,6 +587,24 @@ class BoardView:
             if shooter is not None and shooter.type == "CT":
                 self.cracked.add(to)
                 self.shake_t0 = now + 0.15
+        elif kind == "swap":
+            # thief and its target slide past each other simultaneously
+            thief = self.state.board.get(to)
+            other = self.state.board.get(frm)
+            if thief is not None:
+                self.anim = {"type": thief.type, "color": color, "frm": frm,
+                             "to": to, "t0": now,
+                             "dur": ANIM_PROFILES.get("TF", {}).get("dur", 0.15),
+                             "prof": ANIM_PROFILES.get(thief.type, {}),
+                             "captured": False}
+            if other is not None:
+                self._spawn("slide", None, frm_c=to, dest=frm,
+                            ptype=other.type,
+                            color=icons.PLAYER_COLORS[
+                                self._color_of(other.owner)],
+                            dur=0.2)
+        elif kind == "morph":
+            self._spawn("spawnglow", to, dark=True)
         elif kind == "raise":
             self._spawn("spawnglow", to)
         elif kind == "grave":
@@ -784,6 +850,17 @@ class BoardView:
                         col = (255, int(200 * (1 - k)) + 30, 30)
                         pygame.draw.circle(surf, col, (int(px), int(py)),
                                            max(1, int(self.s * 0.16 * (1 - k))))
+            elif kind == "slide":
+                dur = p.get("dur", 0.2)
+                if age < dur:
+                    keep.append(p)
+                    fx, fy = self.cell_to_px(p["frm_c"])
+                    tx, ty = self.cell_to_px(p["dest"])
+                    k = 1 - (1 - age / dur) ** 2
+                    icons.draw_piece(surf, p["ptype"], p["color"],
+                                     int(self.s * 1.15),
+                                     (int(fx + (tx - fx) * k),
+                                      int(fy + (ty - fy) * k)))
             elif kind == "spawnglow":
                 dur = 0.9
                 if age < dur:
@@ -901,6 +978,9 @@ class BoardView:
                 rr = self.s * 0.34
                 pygame.draw.line(surf, GOOD, (cx - rr, cy), (cx + rr, cy), 5)
                 pygame.draw.line(surf, GOOD, (cx, cy - rr), (cx, cy + rr), 5)
+            elif mv.kind == "swap":
+                pygame.draw.circle(surf, ACCENT, (cx, cy), self.s * 0.5, 3)
+                pygame.draw.circle(surf, ACCENT, (cx, cy), self.s * 0.3, 2)
             elif to in gs.board:
                 pygame.draw.circle(surf, (235, 90, 90), (cx, cy), self.s * 0.52, 4)
             else:
@@ -913,8 +993,11 @@ class BoardView:
                 self.anim = None
             else:
                 anim_target = self.anim["to"]
+        sliding = {p["dest"] for p in self.particles
+                   if p["kind"] == "slide"
+                   and now - p["t0"] < p.get("dur", 0.2)}
         for cell, pc in gs.board.items():
-            if cell == anim_target:
+            if cell == anim_target or cell in sliding:
                 continue
             cx, cy = self.cell_to_px(cell)
             col = icons.PLAYER_COLORS[self._color_of(pc.owner)]
@@ -1578,6 +1661,10 @@ class App:
                             else "shoot")
             elif kind == "raise":
                 sounds.play("rattle")   # skeleton claws out of the ground
+            elif kind == "swap":
+                sounds.play("whoosh")   # the thief strikes
+            elif kind == "morph":
+                sounds.play("promote")  # the shaman twists into a new form
             elif kind == "grave":
                 sounds.play("lose")     # an eerie curse settles
             elif kind == "move":
@@ -1688,6 +1775,10 @@ class App:
                 elif (ev.type == pygame.MOUSEMOTION and self._panning
                         and self.screen == "GAME"):
                     self.board.pan_by(*ev.rel)
+                elif (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 3
+                        and self.screen == "GAME" and not self.help_open
+                        and self._rotate_btn_rect().collidepoint(ev.pos)):
+                    self.board.rotate_view(-1)   # counter-clockwise
                 elif (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 3
                         and self.screen == "GAME" and not self.help_open
                         and self.board.area.collidepoint(ev.pos)):
@@ -1809,6 +1900,11 @@ class App:
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if self._help_btn().hit(ev.pos):
                     self.help_open = True
+                    return
+                if self._rotate_btn_rect().collidepoint(ev.pos):
+                    self.board.rotate_view(1)    # clockwise
+                    return
+                if self._shop_click(ev.pos):
                     return
                 if self.pending_move is not None:
                     for key, b in self._confirm_buttons():
@@ -2132,10 +2228,10 @@ class App:
             lbl = "%s: %s" % (SWAP_SHORT.get(troop, troop),
                               SWAP_SHORT.get(target, "off") if target
                               else "off")
-            cx_ = sp.x + 258 + (i % 2) * 170
-            cy_ = sp.y + 34 + (i // 2) * 38
-            out.append((Button(lbl, (cx_, cy_, 160, 30),
-                               color=PANEL_LIGHT, sz=12),
+            cx_ = sp.x + 252 + (i % 2) * 172
+            cy_ = sp.y + 28 + (i // 2) * 27
+            out.append((Button(lbl, (cx_, cy_, 164, 24),
+                               color=PANEL_LIGHT, sz=11),
                         lambda tr=troop: self._cycle_swap(tr)))
         for name, iy in self._lobby_online_rows():
             out.append((Button("INVITE", (W - 60 - 110, iy - 4, 90, 30),
@@ -2270,6 +2366,100 @@ class App:
         W, _ = self.win.get_size()
         return Button("?", (W - 54, 12, 40, 40), color=(120, 126, 140), sz=22)
 
+    # ---------- shaman soul shop ----------
+
+    def _shop_active(self):
+        gs = self.board.state
+        sel = self.board.selected
+        if gs is None or sel is None or gs.winner is not None:
+            return None
+        pc = gs.board.get(sel)
+        if pc is None or pc.type != "SH" or pc.owner != self.board.my_pid:
+            return None
+        return pc
+
+    def _shop_rows(self):
+        """[(type, rect, cost, buyable)] laid out in the side panel."""
+        pc = self._shop_active()
+        if pc is None:
+            return []
+        W, H = self.win.get_size()
+        side_w = 250
+        sx = W - side_w
+        costs = getattr(engine, "MORPH_COSTS", {})
+        buyable = {mv.arg for mv in self.board.morphs
+                   if getattr(mv, "arg", None)}
+        rows = []
+        y = 64 + 64
+        order = sorted(costs, key=lambda t: (costs[t],
+                                             engine.PIECE_NAMES.get(t, t)))
+        row_h = max(22, min(30, (H - y - 40) // max(1, len(order))))
+        for tp in order:
+            rows.append((tp, pygame.Rect(sx + 8, y, side_w - 16, row_h - 2),
+                         costs[tp], tp in buyable))
+            y += row_h
+        return rows
+
+    def _shop_click(self, pos):
+        pc = self._shop_active()
+        if pc is None:
+            return False
+        for tp, rect, _cost, buyable in self._shop_rows():
+            if rect.collidepoint(pos):
+                if buyable:
+                    mv = next((m for m in self.board.morphs
+                               if getattr(m, "arg", None) == tp), None)
+                    if mv is not None:
+                        self.submit_move(mv)
+                        self.board.select_cell(None)
+                else:
+                    self.toast("Not enough souls", BAD)
+                return True
+        return False
+
+    def _draw_shop(self, sx, side_w, top_h, mouse):
+        pc = self._shop_active()
+        souls = getattr(pc, "uses", 0)
+        draw_text(self.win, "SOUL SHOP", (sx + 16, top_h + 12), 15, ACCENT,
+                  bold=True)
+        draw_text(self.win, "SOULS: %d  (+1 per kill)" % souls,
+                  (sx + 16, top_h + 34), 14, TEXT)
+        for tp, rect, cost, buyable in self._shop_rows():
+            hov = rect.collidepoint(mouse) and buyable
+            if hov:
+                pygame.draw.rect(self.win, PANEL_LIGHT, rect, border_radius=6)
+            col = TEXT if buyable else (105, 108, 118)
+            icons.draw_piece(self.win, tp,
+                             icons.PLAYER_COLORS[self.board._color_of(
+                                 self.board.my_pid)] if buyable
+                             else (80, 82, 90),
+                             rect.h - 6, (rect.x + 14, rect.centery))
+            draw_text(self.win, engine.PIECE_NAMES.get(tp, tp),
+                      (rect.x + 30, rect.y + 2), 14, col, bold=buyable)
+            draw_text(self.win, "%d" % cost, (rect.right - 8, rect.y + 2), 14,
+                      GOOD if buyable else col, bold=True, right=True)
+
+    def _rotate_btn_rect(self):
+        a = self.board.area
+        return pygame.Rect(a.right - 56, a.bottom - 56, 46, 46)
+
+    def _draw_rotate_btn(self, mouse):
+        r = self._rotate_btn_rect()
+        hov = r.collidepoint(mouse)
+        pygame.draw.rect(self.win, PANEL_LIGHT if hov else PANEL, r,
+                         border_radius=12)
+        pygame.draw.rect(self.win, ACCENT if hov else (0, 0, 0), r, 2,
+                         border_radius=12)
+        cx, cy = r.center
+        rad = 13
+        pygame.draw.arc(self.win, TEXT, pygame.Rect(cx - rad, cy - rad,
+                                                    rad * 2, rad * 2),
+                        0.6, 5.2, 3)
+        ax = cx + rad * math.cos(0.6)
+        ay = cy - rad * math.sin(0.6)
+        pygame.draw.polygon(self.win, TEXT, [
+            (ax + 5, ay), (ax - 4, ay - 5), (ax - 4, ay + 5)])
+
     def _confirm_buttons(self):
         area = self.board.area
         cx = area.centerx
@@ -2354,6 +2544,8 @@ class App:
             draw_text(self.win, "YOUR KING IS IN DANGER!", (W // 2, H - bot_h - 12), 20,
                       col, bold=True, center=True)
 
+        self._draw_rotate_btn(mouse)
+
         # pending-move confirmation (settings > CONFIRM MOVES)
         if self.pending_move is not None:
             for _key, b in self._confirm_buttons():
@@ -2377,15 +2569,20 @@ class App:
             draw_text(self.win, "TIME LEFT  %d:%02d" % divmod(tot_left, 60),
                       (sx + 16, y), 16, tcol, bold=True)
             y += 26
-        draw_text(self.win, "BATTLE LOG", (sx + 16, y), 14, TEXT_DIM, bold=True)
-        y += 26
-        for line in gs.log[-12:]:
-            for ln in wrap_text(line, 14, side_w - 30)[:2]:
-                draw_text(self.win, ln, (sx + 16, y), 14, TEXT)
-                y += 18
-            y += 4
+        if self._shop_active() is not None:
+            self._draw_shop(sx, side_w, top_h, mouse)
+        else:
+            draw_text(self.win, "BATTLE LOG", (sx + 16, y), 14, TEXT_DIM,
+                      bold=True)
+            y += 26
+            for line in gs.log[-12:]:
+                for ln in wrap_text(line, 14, side_w - 30)[:2]:
+                    draw_text(self.win, ln, (sx + 16, y), 14, TEXT)
+                    y += 18
+                y += 4
         sel = self.board.selected
-        if sel is not None and sel in gs.board:
+        if (sel is not None and sel in gs.board
+                and self._shop_active() is None):
             pc = gs.board[sel]
             iy = H - 150
             pygame.draw.rect(self.win, PANEL_LIGHT, (sx + 8, iy, side_w - 16, 140),
@@ -2424,9 +2621,10 @@ class App:
     # ---------- overlays ----------
 
     HELP_TYPES = ["K", "Q", "R", "B", "N", "P", "CN", "AR", "WZ", "DR", "CH",
-                  "BM", "GH", "NE", "SK", "CT", "VA", "GO", "JG", "SN", "WD"]
+                  "BM", "GH", "NE", "SK", "CT", "VA", "GO", "JG", "SN", "WD",
+                  "TF", "SH", "MI"]
     CLASSIC_TYPES = ("K", "Q", "R", "B", "N", "P")
-    SWAPPABLE_TYPES = ("CT", "VA", "GO", "JG", "SN", "WD")
+    SWAPPABLE_TYPES = ("CT", "VA", "GO", "JG", "SN", "WD", "TF", "SH", "MI")
 
     def _help_visible_types(self):
         """In a match: only the troops actually in THIS game (skeletons count
@@ -2648,10 +2846,31 @@ def _selftest_sniper():
     pygame.quit()
 
 
+def _selftest_update():
+    """End-to-end check of the updater plumbing: the release must be visible
+    and its exe downloadable. No swap/restart (that part is covered by the
+    bat mechanics test in the repo's scripts)."""
+    import tempfile
+
+    import net as _net
+    rel = _net.get_latest_release()
+    assert rel and rel.get("url"), "no release visible from GitHub"
+    dest = os.path.join(tempfile.gettempdir(), "chess3_update_probe.exe")
+    ok = _net.download_file(rel["url"], dest)
+    size = os.path.getsize(dest) if ok and os.path.exists(dest) else 0
+    if os.path.exists(dest):
+        os.remove(dest)
+    assert ok and size > 10_000_000, "download failed (%s bytes)" % size
+    print("SELFTEST OK update tag=%s size=%d" % (rel["tag"], size))
+
+
 def main():
     if os.environ.get("CHESS3_SELFTEST") == "sniper":
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         _selftest_sniper()
+        return
+    if os.environ.get("CHESS3_SELFTEST") == "update":
+        _selftest_update()
         return
     try:
         App().run()

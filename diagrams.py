@@ -4,10 +4,12 @@
 same pointy-top math and cell shade trio as the game board) with the piece
 at the center and its legal moves marked:
 
-    green dot       = quiet move
-    red ring        = capture
-    red crosshair   = shoot target
-    green plus      = necromancer raise
+    green dot         = quiet move
+    red ring          = capture
+    red crosshair     = shoot target
+    green plus        = necromancer raise
+    teal double ring  = thief swap target (v5; color exposed as SWAP_COLOR
+                        so main.py's board markers can match it)
 
 Every marker comes from REAL engine movegen on a small demo GameState —
 nothing is hand-placed. Per-type demo setups add gray enemy pieces
@@ -24,6 +26,14 @@ The v4 skeleton gets an enemy on each of its 3 forward capture diagonals,
 so its diagram shows the pawn-style stab pattern plus the two quiet
 forward steps. Pawns (and the skeleton) use seat edge 0, so "forward"
 is up.
+
+V5 demos: the thief gets an enemy pawn and a FRIENDLY pawn in swap range
+(swaps work on both sides — never on kings, never as captures), the
+shaman is bare so its 4 non-sideways steps show (its free morph moves
+exist in movegen but are never drawn — the soul shop is their UI, so
+every kind=="morph" move is skipped when painting markers), and the
+mimic demo pins the state's ``mimic_type`` to "N" so the diagram shows
+the copied knight jump pattern.
 
 Surfaces are cached per (ptype, width, icons style fingerprint) — V3.3
 theme styling changes the pieces, so a style change misses the old cache
@@ -65,6 +75,9 @@ CAPTURE_COLOR = (235, 90, 90)
 SHOOT_COLOR = (240, 110, 110)
 RAISE_COLOR = (120, 220, 130)
 HATCH_COLOR = (255, 150, 60)
+# v5 thief swap targets: a teal double ring. Exposed so main.py can use
+# the exact same color for its in-game swap markers.
+SWAP_COLOR = (80, 205, 215)
 
 # Where the demo piece stands (origin of the radius-6 demo board).
 _CENTER = (0, 0)
@@ -91,13 +104,19 @@ _DEMO_ENEMIES = {
     # of seat edge 0 (F1=(0,-1), F2=(1,-1)); the two forward steps stay
     # empty so the quiet markers show too
     "SK": (((1, -2), "P"), ((-1, -1), "P"), ((2, -1), "P")),
+    # v5 thief: an enemy pawn 2 steps down a ray — the first piece within
+    # swap range, so a swap marker lands ON it (plus a quiet dot before it)
+    "TF": (((2, 0), "P"),),
 }
 
 # Per-type friendly pieces (owner 0, drawn in the demo blue). The
 # juggernaut's charge stops on the last empty cell BEFORE a friendly
-# blocker — that quiet endpoint is the diagram's signature marker.
+# blocker — that quiet endpoint is the diagram's signature marker. The
+# v5 thief also swaps with its OWN pieces: a friendly pawn one step down
+# another ray gets a swap marker too (friend or enemy, kings excepted).
 _DEMO_FRIENDS = {
     "JG": (((0, 3), "P"),),
+    "TF": (((-1, 1), "P"),),
 }
 
 _CACHE = {}
@@ -114,7 +133,8 @@ def demo_state(ptype):
     The board is cleared, the demo piece (owner 0, moved=True, seat edge 0)
     is placed at the center, plus the per-type gray enemies (owner 1) and
     friendly blockers (owner 0). The necromancer gets one lost pawn so its
-    raise moves exist.
+    raise moves exist; the mimic demo pins ``mimic_type`` to "N" so the
+    diagram shows a concrete copied pattern (the knight's).
     """
     if ptype not in engine.PIECE_NAMES:
         raise ValueError("unknown piece type: %r" % (ptype,))
@@ -130,6 +150,8 @@ def demo_state(ptype):
         gs.board[cell] = engine.Piece(t, 0, True)
     if ptype == "NE":
         gs.lost[0].append("P")
+    if ptype == "MI":
+        gs.mimic_type = "N"
     return gs
 
 
@@ -232,9 +254,11 @@ def movement_diagram(ptype, width=240):
     icons.draw_piece(surf, ptype, icons.PLAYER_COLORS[DEMO_COLOR_INDEX],
                      piece_size, (int(ccx), int(ccy)))
 
-    # movegen markers (drawn on top so they read over the gray pieces)
+    # movegen markers (drawn on top so they read over the gray pieces).
+    # Morph moves (v5 shaman) share to == from == the piece's own cell:
+    # they have no board target to mark — the soul shop is their UI.
     for mv in moves:
-        if mv.to not in window:
+        if mv.kind == "morph" or mv.to not in window:
             continue
         cx, cy = to_px(mv.to)
         if mv.kind == "shoot":
@@ -252,6 +276,11 @@ def movement_diagram(ptype, width=240):
                              (cx - rr, cy), (cx + rr, cy), w)
             pygame.draw.line(surf, RAISE_COLOR,
                              (cx, cy - rr), (cx, cy + rr), w)
+        elif mv.kind == "swap":
+            # v5 thief: small teal double ring on the swap partner
+            w = max(2, int(round(s * 0.085)))
+            pygame.draw.circle(surf, SWAP_COLOR, (cx, cy), s * 0.52, w)
+            pygame.draw.circle(surf, SWAP_COLOR, (cx, cy), s * 0.32, w)
         elif mv.to in gs.board:
             w = max(2, int(round(s * 0.11)))
             pygame.draw.circle(surf, CAPTURE_COLOR, (cx, cy), s * 0.52, w)

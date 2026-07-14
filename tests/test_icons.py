@@ -50,10 +50,11 @@ class TestIcons(unittest.TestCase):
         _reset_style()
 
     def test_constants(self):
-        """21 types, 6 player colors of valid (r, g, b) tuples."""
-        self.assertEqual(len(icons.TYPE_ORDER), 21)
-        self.assertEqual(len(set(icons.TYPE_ORDER)), 21)
-        for new_type in ("CT", "VA", "GO", "JG", "SN", "WD", "SK"):
+        """24 types, 6 player colors of valid (r, g, b) tuples."""
+        self.assertEqual(len(icons.TYPE_ORDER), 24)
+        self.assertEqual(len(set(icons.TYPE_ORDER)), 24)
+        for new_type in ("CT", "VA", "GO", "JG", "SN", "WD", "SK",
+                         "TF", "SH", "MI"):
             self.assertIn(new_type, icons.TYPE_ORDER)
         self.assertEqual(len(icons.PLAYER_COLORS), 6)
         for color in icons.PLAYER_COLORS:
@@ -87,15 +88,15 @@ class TestIcons(unittest.TestCase):
             icons.draw_piece(surf, "XX", (200, 0, 0), 36, (32, 32))
 
     def test_preview_size_sane(self):
-        """render_all_preview returns a 21-col x 6-row grid of `cell` px."""
+        """render_all_preview returns a 24-col x 6-row grid of `cell` px."""
         for cell in (48, 64):
             surf = icons.render_all_preview(cell)
-            self.assertEqual(surf.get_width(), 21 * cell)
+            self.assertEqual(surf.get_width(), 24 * cell)
             self.assertEqual(surf.get_height(),
                              len(icons.PLAYER_COLORS) * cell)
 
     def test_glyphs_pairwise_distinct(self):
-        """Same-color renders of all 21 types differ pixel-for-pixel."""
+        """Same-color renders of all 24 types differ pixel-for-pixel."""
         color = icons.PLAYER_COLORS[3]  # blue
         bufs = {}
         for ptype in icons.TYPE_ORDER:

@@ -6,11 +6,14 @@ board size at which the start position is QUIET:
   * zero placement displacements and all 24*n pieces actually placed,
   * NO capture, shoot, or instant promotion available to ANY player on
     ply 1 -- for the DEFAULT army AND for every single swap: each of the
-    swap troops in engine.SWAP_TROOPS (v3: CT/VA/GO/JG/SN/WD) substituted
-    into each swappable slot.
+    swap troops in engine.SWAP_TROOPS (v5: CT/VA/GO/JG/SN/WD/TF/SH/MI)
+    substituted into each slot of engine.SWAPPABLE_TYPES (v5: the 8 troop
+    slots plus R/N/B/Q).  Ply-1 thief swaps and shaman morphs are fine —
+    they are not captures.
 
 If a swap breaks quietness at a size, the size is increased (v3 stressor:
-JG's 5-cell ortho charge).  The hexagon layout is fixed (v1 machine-tuned)
+JG's 5-cell ortho charge; the v5 matrix re-searched to identical sizes).
+The hexagon layout is fixed (v1 machine-tuned)
 and only its sizes may grow.  For the other shapes a small set of row-shift
 candidates is also explored; the winner is the (shifts, sizes) combo with
 the smallest total size (ties prefer the earlier/default candidate).

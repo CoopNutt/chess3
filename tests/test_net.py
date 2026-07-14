@@ -316,6 +316,29 @@ class TestMatchSettings(unittest.TestCase):
             self.assertTrue(err)
         self.assertEqual(self.server.get_settings(), net.DEFAULT_SETTINGS)
 
+    def test_v5_swap_slots_and_troops(self):
+        # v5 widened both tables: TF/SH/MI are valid replacements and the
+        # classic R/N/B/Q became swappable slots.
+        ok, err = self.server.set_settings(
+            {"swaps": {"R": "TF", "NE": "SH", "Q": "MI"}})
+        self.assertTrue(ok, err)
+        lob = drain_last(self.server.events, "lobby")
+        self.assertEqual(lob["settings"]["swaps"],
+                         {"R": "TF", "NE": "SH", "Q": "MI"})
+        # ... while dupes and unknowns are still rejected atomically
+        for bad in (
+            {"R": "TF", "N": "TF"},    # TF used twice
+            {"R": "XX"},               # unknown replacement
+            {"P": "TF"},               # pawns stay unswappable
+            {"K": "SH"},               # so do kings
+            {"TF": "SH"},              # swap troops are not slots
+        ):
+            ok, err = self.server.set_settings({"swaps": bad})
+            self.assertFalse(ok, "accepted bad swaps %r" % (bad,))
+            self.assertTrue(err)
+        self.assertEqual(self.server.get_settings()["swaps"],
+                         {"R": "TF", "NE": "SH", "Q": "MI"})
+
     def test_settings_locked_after_start(self):
         self.join("Ann")
         ok, err = self.server.start_game()
@@ -342,8 +365,8 @@ class TestMatchSettings(unittest.TestCase):
 
 
 class TestVersionGate(unittest.TestCase):
-    """v4: protocol version 4 enforced at hello (Skeletons + graveyards
-    cross the wire, so v3 clients are now kicked too).
+    """v5: protocol version 5 enforced at hello (Thief/Shaman/Mimic and
+    Move.arg cross the wire, so v4 clients are now kicked too).
 
     The kick message text is unchanged — old clients must still get a
     readable "grab the new exe" hint.
@@ -358,11 +381,11 @@ class TestVersionGate(unittest.TestCase):
         self.server.close()
         time.sleep(0.1)
 
-    def test_protocol_version_is_4(self):
-        self.assertEqual(net.PROTOCOL_VERSION, 4)
+    def test_protocol_version_is_5(self):
+        self.assertEqual(net.PROTOCOL_VERSION, 5)
 
     def test_old_version_kicked(self):
-        for old_ver in (1, 2, 3):
+        for old_ver in (1, 2, 3, 4):
             reply = raw_hello(self.port,
                               {"t": "hello", "name": "Old", "ver": old_ver})
             self.assertEqual(reply["t"], "kicked")
@@ -374,7 +397,7 @@ class TestVersionGate(unittest.TestCase):
         self.assertIn("version mismatch", reply["reason"])
 
     def test_current_version_welcomed(self):
-        c = net.NetClient()   # sends ver = PROTOCOL_VERSION = 4
+        c = net.NetClient()   # sends ver = PROTOCOL_VERSION = 5
         c.connect("127.0.0.1", self.port, "New", timeout=5.0)
         self.assertEqual(c.pid, 1)
         c.close()
@@ -885,6 +908,155 @@ class TestGraveFlow(unittest.TestCase):
         piece = engine.GameState.from_dict(sa).board[(0, 0)]
         self.assertEqual((piece.type, piece.owner, piece.moved, piece.uses),
                          ("SK", 0, True, 2))
+
+
+class TestThiefShamanWireGame(unittest.TestCase):
+    """v5: a real localhost game with swaps {"R":"TF","NE":"SH"} — a thief
+    swap and a shaman morph travel through NetClient and every participant
+    converges; the Move `arg` field survives the wire.
+
+    Like the grave test, the authoritative board is nudged under the server
+    lock (thief + a host pawn teleported to the empty centre, the shaman
+    fed souls) so the special moves are LEGAL when their owner's turn comes;
+    the moves themselves go through the normal wire path.
+    """
+
+    def setUp(self):
+        self.port = free_port()
+        self.server = net.HostServer("Host", self.port)
+        self.server.start()
+        self.clients = []
+
+    def tearDown(self):
+        for c in self.clients:
+            c.close()
+        self.server.close()
+        time.sleep(0.1)
+
+    def join(self, name):
+        c = net.NetClient()
+        c.connect("127.0.0.1", self.port, name, timeout=5.0)
+        self.clients.append(c)
+        return c
+
+    def _wait_states(self, ann, bob):
+        """Next state broadcast from all three queues; must converge."""
+        mh = wait_for(self.server.events, "state")
+        ma = wait_for(ann.events, "state")
+        mb = wait_for(bob.events, "state")
+        self.assertEqual(mh["state"], ma["state"], "Ann diverged")
+        self.assertEqual(mh["state"], mb["state"], "Bob diverged")
+        return mh
+
+    def test_thief_swap_and_shaman_morph_over_the_wire(self):
+        ok, err = self.server.set_settings(
+            {"swaps": {"R": "TF", "NE": "SH"}})
+        self.assertTrue(ok, err)
+        ann = self.join("Ann")
+        bob = self.join("Bob")
+        ok, err = self.server.start_game()
+        self.assertTrue(ok, err)
+        sh0 = wait_for(self.server.events, "start")["state"]
+        sa0 = wait_for(ann.events, "start")["state"]
+        sb0 = wait_for(bob.events, "start")["state"]
+        self.assertEqual(sh0, sa0)
+        self.assertEqual(sh0, sb0)
+
+        # the swaps really shaped the armies: both rooks in EVERY army
+        # became thieves, every necromancer slot a shaman
+        types = [row[2] for row in sh0["board"]]
+        self.assertEqual(types.count("TF"), 6)
+        self.assertEqual(types.count("SH"), 3)
+        self.assertNotIn("R", types)
+        self.assertNotIn("NE", types)
+        self.assertEqual(sh0["mimic"], "P")
+
+        # -- craft the board under the server lock (grave-test style) --
+        with self.server._lock:
+            gs = self.server._gs
+            self.assertEqual(gs.turn_pid, 0)   # fresh game: host to move
+            self.assertNotIn((0, 0), gs.board)
+            self.assertNotIn((0, 1), gs.board)
+            tf_cell = next(c for c, pc in gs.board.items()
+                           if pc.owner == ann.pid and pc.type == "TF")
+            gs.board[(0, 0)] = gs.board.pop(tf_cell)
+            p_cell = next(c for c, pc in gs.board.items()
+                          if pc.owner == 0 and pc.type == "P")
+            gs.board[(0, 1)] = gs.board.pop(p_cell)
+            sh_cell = next(c for c, pc in gs.board.items()
+                           if pc.owner == bob.pid and pc.type == "SH")
+            gs.board[sh_cell].uses = 5   # souls for a Queen (cost 5)
+            # a quiet host move that leaves the crafted cells alone
+            host_mv = next(m for m in gs.all_legal_moves(0)
+                           if m.kind == "move"
+                           and m.from_ not in ((0, 0), (0, 1))
+                           and m.to not in ((0, 0), (0, 1))
+                           and m.to != sh_cell)
+        self.server.submit_host_move(host_mv.to_dict())
+        msg = self._wait_states(ann, bob)
+        self.assertEqual(msg["state"]["turn_pid"], ann.pid)
+
+        # -- Ann's thief swaps places with the host pawn, via NetClient --
+        swap_dict = engine.Move((0, 0), (0, 1), "swap").to_dict()
+        self.assertNotIn("arg", swap_dict)   # arg omitted when None
+        ann.send_move(swap_dict)
+        msg = self._wait_states(ann, bob)
+        self.assertEqual(msg["last_move"],
+                         {"pid": ann.pid, "move": {"from": [0, 0],
+                                                   "to": [0, 1],
+                                                   "kind": "swap"}})
+        sd = msg["state"]
+        gs2 = engine.GameState.from_dict(sd)
+        thief = gs2.board[(0, 1)]
+        pawn = gs2.board[(0, 0)]
+        self.assertEqual((thief.type, thief.owner, thief.moved),
+                         ("TF", ann.pid, True))
+        # the swapped pawn is intact — nothing died, flags untouched
+        self.assertEqual((pawn.type, pawn.owner, pawn.moved),
+                         ("P", 0, False))
+        self.assertEqual(sd["mimic"], "TF")
+        self.assertNotIn("P", sd["lost"][str(0)])
+        self.assertTrue(any("swaps places with" in line
+                            for line in sd["log"]))
+        self.assertEqual(sd["turn_pid"], bob.pid)
+
+        # -- Bob's shaman morphs into a Queen: `arg` crosses the wire --
+        morph = engine.Move(sh_cell, sh_cell, "morph", "Q")
+        self.assertEqual(morph.to_dict()["arg"], "Q")
+        bob.send_move(morph.to_dict())
+        msg = self._wait_states(ann, bob)
+        want = {"pid": bob.pid,
+                "move": {"from": [sh_cell[0], sh_cell[1]],
+                         "to": [sh_cell[0], sh_cell[1]],
+                         "kind": "morph", "arg": "Q"}}
+        self.assertEqual(msg["last_move"], want)
+        # the arg round-trips through Move.from_dict on the receiving side
+        got = engine.Move.from_dict(msg["last_move"]["move"])
+        self.assertEqual(got, morph)
+        self.assertEqual(got.arg, "Q")
+        sd = msg["state"]
+        gs3 = engine.GameState.from_dict(sd)
+        queen = gs3.board[sh_cell]
+        self.assertEqual((queen.type, queen.owner, queen.uses),
+                         ("Q", bob.pid, 0))   # 5 souls, all spent
+        self.assertEqual(sd["mimic"], "SH")
+        self.assertTrue(any("Shaman twists into a Queen!" in line
+                            for line in sd["log"]))
+
+        # -- and the game keeps flowing over the cursed-with-novelty board --
+        chan = {ann.pid: ann, bob.pid: bob}
+        rng = random.Random(5)
+        state = sd
+        for _ply in range(30):
+            gs = engine.GameState.from_dict(state)
+            if gs.winner is not None:
+                break
+            mv = rng.choice(gs.all_legal_moves(gs.turn_pid))
+            if gs.turn_pid == 0:
+                self.server.submit_host_move(mv.to_dict())
+            else:
+                chan[gs.turn_pid].send_move(mv.to_dict())
+            state = self._wait_states(ann, bob)["state"]
 
 
 @contextlib.contextmanager

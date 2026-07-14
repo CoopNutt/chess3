@@ -737,3 +737,94 @@ in the match, startup update check with in-app prompt -> download to
 Chess3_new.exe -> swap-and-restart via a generated .bat, VERSION constant.
 
 New sounds (sounds.py): grind, slam, lightning, fire, whoosh, cannon, rattle.
+
+---
+
+# V5 ADDENDUM
+
+## V5.1 Move gains an optional argument (engine.py)
+
+Move grows a 4th field `arg` (string|None, default None), used by morphs.
+`to_dict()` includes `"arg"` ONLY when not None; `from_dict` accepts both.
+MOVE_KINDS gains "swap" and "morph". eq/hash include arg.
+PROTOCOL_VERSION bumps to 5 (net.py; kick text unchanged).
+
+## V5.2 Three new swap troops
+
+- **TF Thief**: slides along ORTHO rays like a rook but can NEVER capture.
+  Instead, kind="swap": along each ORTHO ray, if the FIRST piece within 3
+  steps (empties between) is any piece except a King (either side), the thief
+  may exchange cells with it. Swaps are not captures: warden auras ignore
+  them, nothing dies, no souls are gained. apply_move exchanges the two
+  pieces (both get moved=True... only the thief gets moved=True; the victim
+  keeps its own flags). A thief never threatens anything (king_in_danger
+  ignores it entirely).
+- **SH Shaman**: steps 1 cell along the 4 ORTHO dirs EXCLUDING (1,0) and
+  (-1,0) (the two horizontal "sides"), moving or capturing. Piece.uses is its
+  SOUL counter: +1 every time the shaman itself captures. kind="morph"
+  (from_==to==its cell, arg=target type): spend souls to permanently become
+  `arg`. MORPH_COSTS (exported dict) = {"P":0,"SK":0, "N":2,"R":2,"B":2,
+  "CN":2,"AR":2,"SN":2,"TF":2, "CH":3,"VA":3,"GH":3,"NE":3,"GO":3,"CT":3,
+  "BM":3,"MI":3, "JG":4,"DR":4,"WZ":4, "Q":5,"WD":5}. "K" and "SH" are not
+  morphable. Morphing consumes the turn, subtracts the cost from uses, keeps
+  the remaining souls in uses (harmless for the new type), logs
+  "NAME's Shaman twists into a X!". Movegen emits a morph move for every
+  affordable type. Morphing never changes cell occupancy so it can never
+  block a check — if your king is in danger, morphs are filtered out like
+  any other non-resolving move.
+- **MI Mimic**: moves exactly like the LAST piece that acted in the game.
+  GameState gains `mimic_type` (default "P", serialized as "mimic",
+  from_dict back-compat default "P"). After every successful apply_move:
+  kind move/shoot -> the actor's type at move start; swap -> "TF";
+  raise -> "NE"; morph -> "SH"; grave -> unchanged — EXCEPT when the actor is
+  an MI (mimics don't copy mimics). _moves_MI: delegate to
+  _GEN[mimic_type] with a stand-in Piece(mimic_type, owner, moved, uses),
+  then DROP kind=="morph" moves (a mimic has no souls worth spending).
+  Everything else (shoots, swaps, raises) is copied faithfully.
+
+SWAP_TROOPS = ("CT","VA","GO","JG","SN","WD","TF","SH","MI").
+SWAPPABLE_TYPES gains the base pieces: ("CN","AR","WZ","DR","CH","BM","GH",
+"NE","R","N","B","Q") — swapping a type replaces ALL of that type in every
+army (both rooks/knights). "P" and "K" stay unswappable.
+
+## V5.3 King-safety and attack-test updates (engine.py)
+
+- _exposes_king: kind "swap" simulates BOTH pieces exchanging (a swap can
+  pull your own blocker off a line!); "morph" changes nothing positionally —
+  it is exposed iff the king is attacked right now.
+- _cell_attacked: TF never attacks. SH attacks on its 4 dirs at step 1
+  (capture-capable). MI attacks as whatever mimic_type currently is: use an
+  effective-type helper (pc.type=="MI" -> gs.mimic_type) everywhere types are
+  compared; a mimic of a pawn threatens like a pawn OF ITS OWNER'S SEAT.
+  The differential fuzz (king_in_danger vs _king_in_danger_scan) must be
+  extended to games with TF/SH/MI swapped in — it is the ground truth here.
+- Quiet-start: rerun scripts/search_layouts.py with the EXPANDED swap matrix
+  (9 troops x 12 slots); bump SHAPE_SIZE where needed. TF swaps existing at
+  ply 1 are fine (not captures); SH morph-to-pawn at ply 1 is legal and fine.
+
+## V5.4 Board view rotation (main.py — mine)
+
+Bottom-right board button: left-click rotates the VIEW one step clockwise,
+right-click counter-clockwise. Steps by shape symmetry: hexagon/octagon
+rotate60 (6 views), square cycle [identity, mirror swap(q,r)->(r,q),
+180 point-reflect, both] (4 views), triangle R120(q,r)=(T-q-r, q) (3 views).
+Applied on top of the seat orientation when building _t2d.
+
+## V5.5 UI (main.py — mine)
+
+Soul shop replaces the battle log while YOUR OWN living Shaman is selected on
+any screen state: rows of [icon, name, cost] for every morphable type,
+affordable rows clickable (submit the morph move), unaffordable dimmed,
+header shows "SOULS: N". Enemy shamans never show their souls. Thief swap
+targets render as a distinct marker (theme-accent double ring). Morph moves
+are EXCLUDED from BoardView.legal (they all share to==from and would collide;
+the shop is their UI). Swap animation: thief and target slide simultaneously.
+New piece anims: TF dash, SH slow + purple morph glow, MI normal slide.
+
+## V5.6 Auto-update verification
+
+CHESS3_SELFTEST="update" mode: force a low local VERSION, run the release
+check synchronously, download the real latest exe to the scratch temp dir,
+verify size > 10MB, and print SELFTEST OK (no bat, no restart). Separately, a
+scratch-dir mechanics test proves the generated update .bat correctly waits,
+swaps files and relaunches (using a dummy exe, not the game).

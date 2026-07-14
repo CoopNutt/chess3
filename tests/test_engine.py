@@ -1,6 +1,7 @@
 """Engine rules tests: crafted-position tests for all new troops (v1's 8 +
-v2's CT/VA/GO + v3's JG/SN/WD), board-shape geometry, swaps, timers, quiet
-starts for every (shape, player count), and randomized full-game fuzzing."""
+v2's CT/VA/GO + v3's JG/SN/WD + v5's TF/SH/MI), board-shape geometry, swaps,
+timers, quiet starts for every (shape, player count), and randomized
+full-game fuzzing."""
 import json
 import os
 import random
@@ -797,9 +798,42 @@ class TestSwaps(unittest.TestCase):
                  "CH": "JG", "BM": "GO", "GH": "WD"}
         gs = GameState.new_game([(0, "a"), (1, "b")], swaps=swaps)
         types = [pc.type for pc in gs.board.values() if pc.owner == 0]
-        for rep in engine.SWAP_TROOPS:
+        for rep in ("CT", "VA", "GO", "JG", "SN", "WD"):
             self.assertEqual(types.count(rep), 1, rep)
         self.assertEqual(len(types), 24)
+
+    def test_all_nine_swap_troops_at_once(self):
+        # v5: 9 swap troops, 12 swappable slots — all nine in one army.
+        # The R slot holds TWO rooks, so its replacement appears twice.
+        swaps = {"CN": "CT", "AR": "SN", "WZ": "VA", "CH": "JG",
+                 "BM": "GO", "GH": "WD", "R": "TF", "NE": "SH", "B": "MI"}
+        self.assertEqual(len(engine.SWAP_TROOPS), 9)
+        gs = GameState.new_game([(0, "a"), (1, "b")], swaps=swaps)
+        for pid in (0, 1):
+            types = [pc.type for pc in gs.board.values() if pc.owner == pid]
+            self.assertEqual(len(types), 24)
+            for rep in ("CT", "SN", "VA", "JG", "GO", "WD", "SH", "MI"):
+                self.assertEqual(types.count(rep), 1, rep)
+            self.assertEqual(types.count("TF"), 2)   # both rooks
+            for gone in ("CN", "AR", "WZ", "CH", "BM", "GH", "R", "NE", "B"):
+                self.assertNotIn(gone, types)
+
+    def test_v5_classic_slots_replace_all_of_that_type(self):
+        # Swapping a classic type replaces ALL pieces of it in every army.
+        for slot, rep, count in (("R", "TF", 2), ("N", "SH", 2),
+                                 ("B", "MI", 1), ("Q", "WD", 1)):
+            gs = GameState.new_game([(0, "a"), (1, "b")],
+                                    swaps={slot: rep})
+            for pid in (0, 1):
+                types = [pc.type for pc in gs.board.values()
+                         if pc.owner == pid]
+                self.assertNotIn(slot, types, (slot, rep))
+                self.assertEqual(types.count(rep), count, (slot, rep))
+                self.assertEqual(len(types), 24)
+        # pawns and kings stay unswappable
+        for bad in ({"P": "TF"}, {"K": "MI"}):
+            with self.assertRaises(ValueError, msg=bad):
+                GameState.new_game([(0, "a"), (1, "b")], swaps=bad)
 
     def test_bad_swaps_rejected(self):
         players = [(0, "a"), (1, "b")]
@@ -957,7 +991,10 @@ class TestQuietStart(unittest.TestCase):
         picks = ({"CN": "CT"}, {"AR": "GO"}, {"GH": "VA"},
                  {"DR": "VA"}, {"WZ": "VA"}, {"NE": "CT"}, {"BM": "GO"},
                  {"CN": "JG"}, {"DR": "JG"}, {"WZ": "JG"},  # v3: 5-tile charge
-                 {"AR": "SN"}, {"NE": "SN"}, {"GH": "WD"}, {"BM": "WD"})
+                 {"AR": "SN"}, {"NE": "SN"}, {"GH": "WD"}, {"BM": "WD"},
+                 # v5: new troops + the newly swappable classic slots
+                 {"R": "TF"}, {"Q": "SH"}, {"B": "MI"}, {"N": "VA"},
+                 {"Q": "JG"}, {"R": "MI"}, {"N": "SN"}, {"BM": "TF"})
         for shape, n in samples:
             for sw in picks:
                 gs = new_shaped(n, shape, swaps=sw)
@@ -1301,6 +1338,492 @@ class TestSerializationV4(unittest.TestCase):
         self.assertEqual(rt.to_dict(), gs.to_dict())
 
 
+class TestThief(unittest.TestCase):
+    """V5.2: the Thief slides like a rook but never captures; instead it
+    swaps cells with the first non-King piece within 3 ortho steps."""
+
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)   # kings at (-6,0) and (6,0)
+        self.gs.turn_pid = 0
+
+    def test_names_and_descriptions(self):
+        self.assertEqual(engine.PIECE_NAMES["TF"], "Thief")
+        self.assertEqual(engine.PIECE_NAMES["SH"], "Shaman")
+        self.assertEqual(engine.PIECE_NAMES["MI"], "Mimic")
+        for t in ("TF", "SH", "MI"):
+            self.assertIn(t, engine.PIECE_DESCRIPTIONS)
+        self.assertIn("3", engine.PIECE_DESCRIPTIONS["TF"])   # swap range
+        self.assertIn("soul", engine.PIECE_DESCRIPTIONS["SH"].lower())
+        self.assertIn("last", engine.PIECE_DESCRIPTIONS["MI"].lower())
+
+    def test_slides_to_empty_only_and_swaps_friend_or_foe(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("TF", 0)
+        gs.board[(2, 0)] = Piece("N", 1)    # enemy 2 steps out
+        gs.board[(0, 2)] = Piece("P", 0)    # friend 2 steps out
+        mvs = gs.legal_moves((0, 0))
+        self.assertEqual({m.kind for m in mvs}, {"move", "swap"})
+        move_tos = {m.to for m in mvs if m.kind == "move"}
+        swap_tos = {m.to for m in mvs if m.kind == "swap"}
+        self.assertIn((1, 0), move_tos)     # slide up to the enemy...
+        self.assertNotIn((2, 0), move_tos)  # ...but NEVER capture it
+        self.assertIn((0, 1), move_tos)
+        self.assertNotIn((0, 2), move_tos)  # friends block slides too
+        self.assertEqual(swap_tos, {(2, 0), (0, 2)})   # foe AND friend
+
+    def test_swap_range_capped_at_three_and_first_piece_only(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("TF", 0)
+        gs.board[(0, 4)] = Piece("N", 1)    # 4 steps: out of swap reach
+        swaps = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "swap"}
+        self.assertEqual(swaps, set())
+        gs.board[(0, 3)] = Piece("N", 1)    # exactly 3: fine
+        swaps = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "swap"}
+        self.assertEqual(swaps, {(0, 3)})
+        gs.board[(0, 1)] = Piece("P", 0)    # first piece on the ray wins
+        swaps = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "swap"}
+        self.assertEqual(swaps, {(0, 1)})   # cannot reach past it
+
+    def test_swap_ray_walled_by_graveyard(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("TF", 0)
+        gs.board[(0, 2)] = Piece("N", 1)
+        self.assertIn((0, 2), {m.to for m in gs.legal_moves((0, 0))
+                               if m.kind == "swap"})
+        gs.graveyards.add((0, 1))           # wall between thief and target
+        self.assertEqual({m.to for m in gs.legal_moves((0, 0))
+                          if m.kind == "swap"}, set())
+
+    def test_never_swaps_with_kings(self):
+        gs = self.gs
+        gs.board[(5, 0)] = Piece("TF", 0)   # right beside the ENEMY king
+        tos = {m.to for m in gs.legal_moves((5, 0))}
+        self.assertNotIn((6, 0), tos)       # no swap, no capture, nothing
+        gs.board[(-5, 0)] = Piece("TF", 0)  # right beside its OWN king
+        self.assertNotIn((-6, 0), {m.to for m in gs.legal_moves((-5, 0))})
+
+    def test_thief_never_attacks_anything(self):
+        gs = self.gs
+        gs.board[(-6, 3)] = Piece("TF", 1)  # rook-lined up with K0
+        self.assertFalse(gs.king_in_danger(0))
+        self.assertFalse(gs._king_in_danger_scan(0))
+        gs.board[(-5, 0)] = Piece("TF", 1)  # right next to K0
+        self.assertFalse(gs.king_in_danger(0))
+        self.assertFalse(gs._king_in_danger_scan(0))
+        del gs.board[(-5, 0)]
+        gs.board[(-6, 3)] = Piece("R", 1)   # contrast: a rook DOES attack
+        self.assertTrue(gs.king_in_danger(0))
+
+    def test_swap_applies_thief_moved_victim_keeps_flags(self):
+        gs = self.gs
+        tf = Piece("TF", 0)                     # moved=False
+        pn = Piece("P", 1, moved=False, uses=0)
+        gs.board[(0, 0)] = tf
+        gs.board[(0, 2)] = pn
+        ok, err = gs.apply_move(0, Move((0, 0), (0, 2), "swap"))
+        self.assertTrue(ok, err)
+        self.assertIs(gs.board[(0, 2)], tf)     # exchanged cells
+        self.assertIs(gs.board[(0, 0)], pn)
+        self.assertTrue(tf.moved)               # the thief is marked moved
+        self.assertEqual(tf.uses, 0)            # swaps don't tick uses
+        self.assertFalse(pn.moved)              # the victim keeps its flags
+        self.assertEqual(pn.uses, 0)
+        self.assertEqual(gs.lost[0], [])        # nobody died
+        self.assertEqual(gs.lost[1], [])
+        self.assertTrue(any("swaps places" in ln for ln in gs.log))
+        self.assertFalse(any("takes" in ln for ln in gs.log))
+        self.assertEqual(gs.turn_pid, 1)        # the swap consumed the turn
+        self.assertEqual(gs.mimic_type, "TF")
+
+    def test_swap_with_friendly_piece_applies(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("TF", 0)
+        gs.board[(1, -1)] = Piece("CN", 0, moved=True, uses=4)
+        ok, err = gs.apply_move(0, Move((0, 0), (1, -1), "swap"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(1, -1)].type, "TF")
+        cn = gs.board[(0, 0)]
+        self.assertEqual((cn.type, cn.owner, cn.moved, cn.uses),
+                         ("CN", 0, True, 4))
+
+    def test_swap_ignores_warden_aura(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("WD", 1)
+        gs.board[(1, 0)] = Piece("N", 1)     # aura-protected from captures
+        gs.board[(1, 3)] = Piece("R", 0)
+        self.assertNotIn((1, 0), {m.to for m in gs.legal_moves((1, 3))})
+        gs.board[(3, 0)] = Piece("TF", 0)    # ...but not from swaps
+        swaps = {m.to for m in gs.legal_moves((3, 0)) if m.kind == "swap"}
+        self.assertIn((1, 0), swaps)
+        ok, err = gs.apply_move(0, Move((3, 0), (1, 0), "swap"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(1, 0)].type, "TF")
+        self.assertEqual(gs.board[(3, 0)].type, "N")
+        self.assertEqual(gs.lost[1], [])     # a swap is not a capture
+
+    def test_swap_that_hands_an_attacker_the_king_line_is_illegal(self):
+        gs = self.gs
+        # TF on the king's row; enemy rook 2 steps up the q=-4 line.  The
+        # swap would drop the rook onto (-4,0) with a clear lane to K0.
+        gs.board[(-4, 0)] = Piece("TF", 0)
+        gs.board[(-4, 2)] = Piece("R", 1)
+        self.assertFalse(gs.king_in_danger(0))
+        mvs = gs.legal_moves((-4, 0))
+        self.assertTrue(mvs)                        # it CAN do other things
+        self.assertNotIn(Move((-4, 0), (-4, 2), "swap"), mvs)
+        ok, err = gs.apply_move(0, Move((-4, 0), (-4, 2), "swap"))
+        self.assertFalse(ok)
+
+    def test_swap_can_resolve_a_check_by_stealing_the_attacker(self):
+        gs = self.gs
+        gs.board[(-3, 0)] = Piece("R", 1)    # checks K0 along r = 0
+        gs.board[(-3, 3)] = Piece("TF", 0)   # 3 steps up the rook's file
+        self.assertTrue(gs.king_in_danger(0))
+        swap = Move((-3, 3), (-3, 0), "swap")
+        self.assertEqual(gs.legal_moves((-3, 3)), [swap])
+        ok, err = gs.apply_move(0, swap)
+        self.assertTrue(ok, err)
+        self.assertFalse(gs.king_in_danger(0))
+        self.assertEqual(gs.board[(-3, 0)].type, "TF")
+        self.assertEqual(gs.board[(-3, 3)].type, "R")
+
+
+class TestShaman(unittest.TestCase):
+    """V5.2: the Shaman steps on 4 of the 6 ortho dirs, eats souls when it
+    kills, and spends them on permanent morphs."""
+
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    def test_moves_on_four_dirs_only(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("SH", 0)
+        tos = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "move"}
+        self.assertEqual(tos, {(0, 1), (-1, 1), (0, -1), (1, -1)})
+        gs.board[(1, 0)] = Piece("N", 1)    # on a horizontal "side"
+        gs.board[(0, 1)] = Piece("R", 1)    # on a shaman dir
+        tos = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "move"}
+        self.assertIn((0, 1), tos)          # capturable
+        self.assertNotIn((1, 0), tos)       # untouchable, ever
+        self.assertNotIn((-1, 0), tos)
+
+    def test_souls_grow_on_captures_only(self):
+        gs = self.gs
+        sh = Piece("SH", 0)
+        gs.board[(0, 0)] = sh
+        ok, err = gs.apply_move(0, Move((0, 0), (0, -1)))
+        self.assertTrue(ok, err)
+        self.assertEqual(sh.uses, 0)        # quiet moves feed nobody
+        gs.board[(1, -2)] = Piece("N", 1)   # on a shaman dir from (0,-1)
+        gs.turn_pid = 0
+        ok, err = gs.apply_move(0, Move((0, -1), (1, -2)))
+        self.assertTrue(ok, err)
+        self.assertEqual(sh.uses, 1)        # +1 soul per kill
+        self.assertIn("N", gs.lost[1])
+
+    def test_morph_moves_match_affordability_exactly(self):
+        gs = self.gs
+        sh = Piece("SH", 0)
+        gs.board[(0, 0)] = sh
+        for souls in (0, 2, 3, 4, 5, 9):
+            sh.uses = souls
+            morphs = [m for m in gs.legal_moves((0, 0))
+                      if m.kind == "morph"]
+            for m in morphs:
+                self.assertEqual(m.from_, (0, 0))
+                self.assertEqual(m.to, (0, 0))      # from == to
+            expected = {t for t, c in engine.MORPH_COSTS.items()
+                        if c <= souls}
+            self.assertEqual({m.arg for m in morphs}, expected, souls)
+            self.assertNotIn("K", {m.arg for m in morphs})
+            self.assertNotIn("SH", {m.arg for m in morphs})
+        self.assertNotIn("K", engine.MORPH_COSTS)
+        self.assertNotIn("SH", engine.MORPH_COSTS)
+
+    def test_morph_applies_cost_turn_and_log(self):
+        gs = self.gs
+        sh = Piece("SH", 0, moved=True, uses=7)
+        gs.board[(0, 0)] = sh
+        ok, err = gs.apply_move(0, Move((0, 0), (0, 0), "morph", "Q"))
+        self.assertTrue(ok, err)
+        self.assertIs(gs.board[(0, 0)], sh)      # never moved
+        self.assertEqual(sh.type, "Q")
+        self.assertEqual(sh.uses, 2)             # 7 - 5, remainder kept
+        self.assertEqual(gs.turn_pid, 1)         # morphing consumed the turn
+        self.assertTrue(any("twists into a Queen" in ln for ln in gs.log))
+        self.assertEqual(gs.mimic_type, "SH")
+
+    def test_morph_to_every_allowed_type(self):
+        for t, cost in sorted(engine.MORPH_COSTS.items()):
+            gs = fresh(2)
+            clear_keep_kings(gs)
+            gs.turn_pid = 0
+            gs.board[(0, 0)] = Piece("SH", 0, uses=cost + 1)
+            ok, err = gs.apply_move(0, Move((0, 0), (0, 0), "morph", t))
+            self.assertTrue(ok, (t, err))
+            pc = gs.board[(0, 0)]
+            self.assertEqual(pc.type, t)
+            self.assertEqual(pc.uses, 1, t)      # exactly `cost` spent
+
+    def test_bogus_morphs_rejected(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("SH", 0, uses=9)
+        for bad in (Move((0, 0), (0, 0), "morph", "K"),    # never a king
+                    Move((0, 0), (0, 0), "morph", "SH"),   # or a shaman
+                    Move((0, 0), (0, 0), "morph"),         # missing arg
+                    Move((0, 0), (0, 1), "morph", "Q")):   # from != to
+            ok, err = gs.apply_move(0, bad)
+            self.assertFalse(ok, bad)
+        gs.board[(0, 0)].uses = 1
+        ok, err = gs.apply_move(0, Move((0, 0), (0, 0), "morph", "Q"))
+        self.assertFalse(ok)                     # cannot afford a queen
+
+    def test_cannot_morph_while_in_check(self):
+        gs = self.gs
+        gs.board[(3, 3)] = Piece("SH", 0, uses=9)
+        self.assertTrue([m for m in gs.legal_moves((3, 3))
+                         if m.kind == "morph"])
+        gs.board[(0, 0)] = Piece("R", 1)     # checks K0 along r = 0
+        self.assertTrue(gs.king_in_danger(0))
+        # a morph never changes the position, so it can never resolve the
+        # check — every shaman move here is illegal (it can't help at all)
+        self.assertEqual(gs.legal_moves((3, 3)), [])
+
+    def test_shaman_threat_matches_its_four_dirs(self):
+        gs = self.gs
+        gs.board[(-6, 1)] = Piece("SH", 1)   # (0,1) off K0: a shaman dir
+        self.assertTrue(gs.king_in_danger(0))
+        self.assertTrue(gs._king_in_danger_scan(0))
+        del gs.board[(-6, 1)]
+        gs.board[(-5, 0)] = Piece("SH", 1)   # (1,0): the untouchable side
+        self.assertFalse(gs.king_in_danger(0))
+        self.assertFalse(gs._king_in_danger_scan(0))
+
+
+class TestMimic(unittest.TestCase):
+    """V5.2: the Mimic moves exactly like the last piece that acted."""
+
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)
+        self.gs.turn_pid = 0
+
+    def test_defaults_and_serialization(self):
+        gs = fresh(2)
+        self.assertEqual(gs.mimic_type, "P")
+        d = json.loads(json.dumps(gs.to_dict()))
+        self.assertEqual(d["mimic"], "P")
+        rt = GameState.from_dict(d)
+        self.assertEqual(rt.to_dict(), gs.to_dict())
+        d.pop("mimic")                       # pre-v5 dicts have no mimic key
+        self.assertEqual(GameState.from_dict(d).mimic_type, "P")
+        gs.mimic_type = "DR"
+        rt = GameState.from_dict(json.loads(json.dumps(gs.to_dict())))
+        self.assertEqual(rt.mimic_type, "DR")
+        self.assertEqual(rt.to_dict(), gs.to_dict())
+
+    def test_mimic_type_follows_the_table(self):
+        gs = self.gs
+        # kind "move" -> the actor's type at move start
+        gs.board[(0, 0)] = Piece("R", 0)
+        ok, err = gs.apply_move(0, Move((0, 0), (0, 1)))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.mimic_type, "R")
+        # kind "shoot" -> the shooter's type
+        gs.turn_pid = 0
+        gs.board[(3, 0)] = Piece("AR", 0)
+        gs.board[(5, 0)] = Piece("N", 1)
+        ok, err = gs.apply_move(0, Move((3, 0), (5, 0), "shoot"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.mimic_type, "AR")
+        # kind "swap" -> "TF"
+        gs.turn_pid = 0
+        gs.board[(0, -2)] = Piece("TF", 0)
+        ok, err = gs.apply_move(0, Move((0, -2), (0, 1), "swap"))  # the R
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.mimic_type, "TF")
+        # kind "raise" -> "NE"
+        gs.turn_pid = 0
+        gs.board[(2, 2)] = Piece("NE", 0)
+        gs.lost[0].append("P")
+        ok, err = gs.apply_move(0, Move((2, 2), (2, 3), "raise"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.mimic_type, "NE")
+        # kind "morph" -> "SH"
+        gs.turn_pid = 0
+        gs.board[(-2, -2)] = Piece("SH", 0, uses=0)
+        ok, err = gs.apply_move(0, Move((-2, -2), (-2, -2), "morph", "P"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.mimic_type, "SH")
+
+    def test_promoting_pawn_records_pawn_not_queen(self):
+        gs = self.gs
+        gs.mimic_type = "R"
+        gs.board[(0, -5)] = Piece("P", 0, moved=True)
+        ok, err = gs.apply_move(0, Move((0, -5), (0, -6)))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, -6)].type, "Q")   # promoted...
+        self.assertEqual(gs.mimic_type, "P")   # ...but it MOVED as a pawn
+
+    def test_moves_like_the_mimicked_type(self):
+        gs = self.gs
+        gs.mimic_type = "R"
+        gs.board[(0, 0)] = Piece("MI", 0)
+        tos = {m.to for m in gs.legal_moves((0, 0))}
+        self.assertIn((0, 4), tos)           # long rook slide
+        self.assertNotIn((1, 1), tos)        # no diagonal
+        gs.mimic_type = "N"
+        tos = {m.to for m in gs.legal_moves((0, 0))}
+        self.assertEqual(tos, {(0 + dq, 0 + dr) for dq, dr in engine.KNIGHT})
+
+    def test_mimic_actor_never_updates_mimic_type(self):
+        gs = self.gs
+        gs.mimic_type = "R"
+        gs.board[(0, 0)] = Piece("MI", 0)
+        ok, err = gs.apply_move(0, Move((0, 0), (0, 3)))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 3)].type, "MI")   # stays a mimic
+        self.assertEqual(gs.mimic_type, "R")            # copy NOT copied
+
+    def test_mimic_copies_shoots(self):
+        gs = self.gs
+        gs.mimic_type = "AR"
+        gs.board[(0, 0)] = Piece("MI", 0)
+        gs.board[(1, 0)] = Piece("R", 1)     # blocker: archers don't care
+        gs.board[(2, 0)] = Piece("N", 1)
+        shoots = [m for m in gs.legal_moves((0, 0)) if m.kind == "shoot"]
+        self.assertEqual({m.to for m in shoots}, {(2, 0)})
+        ok, err = gs.apply_move(0, shoots[0])
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 0)].type, "MI")   # did not move
+        self.assertNotIn((2, 0), gs.board)
+        self.assertIn("N", gs.lost[1])
+        self.assertEqual(gs.mimic_type, "AR")           # unchanged by MI
+
+    def test_mimic_copies_swaps_but_not_with_kings(self):
+        gs = self.gs
+        gs.mimic_type = "TF"
+        gs.board[(0, 0)] = Piece("MI", 0)
+        gs.board[(0, 2)] = Piece("N", 1)
+        swaps = {m.to for m in gs.legal_moves((0, 0)) if m.kind == "swap"}
+        self.assertEqual(swaps, {(0, 2)})
+        gs.board[(5, 0)] = Piece("MI", 0)    # beside the enemy king
+        self.assertNotIn((6, 0), {m.to for m in gs.legal_moves((5, 0))})
+        ok, err = gs.apply_move(0, Move((0, 0), (0, 2), "swap"))
+        self.assertTrue(ok, err)
+        self.assertEqual(gs.board[(0, 2)].type, "MI")
+        self.assertEqual(gs.board[(0, 0)].type, "N")
+        self.assertEqual(gs.mimic_type, "TF")           # unchanged by MI
+
+    def test_mimic_copies_raises(self):
+        gs = self.gs
+        gs.mimic_type = "NE"
+        gs.board[(0, 0)] = Piece("MI", 0)
+        self.assertEqual([m for m in gs.legal_moves((0, 0))
+                          if m.kind == "raise"], [])    # no lost pawn yet
+        gs.lost[0].append("P")
+        raises = [m for m in gs.legal_moves((0, 0)) if m.kind == "raise"]
+        self.assertEqual(len(raises), 6)
+        ok, err = gs.apply_move(0, raises[0])
+        self.assertTrue(ok, err)
+        risen = gs.board[raises[0].to]
+        self.assertEqual((risen.type, risen.owner, risen.moved, risen.uses),
+                         ("SK", 0, True, 0))
+        self.assertNotIn("P", gs.lost[0])
+        self.assertEqual(gs.board[(0, 0)].type, "MI")   # did not move
+        self.assertEqual(gs.mimic_type, "NE")
+
+    def test_mimic_drops_morphs(self):
+        gs = self.gs
+        gs.mimic_type = "SH"
+        gs.board[(0, 0)] = Piece("MI", 0, uses=9)   # souls to burn — no sale
+        mvs = gs.legal_moves((0, 0))
+        self.assertEqual([m for m in mvs if m.kind == "morph"], [])
+        self.assertEqual({m.to for m in mvs},
+                         {(0, 1), (-1, 1), (0, -1), (1, -1)})  # shaman steps
+
+    def test_mimic_pawn_honors_moved_flag(self):
+        gs = self.gs
+        gs.mimic_type = "P"
+        gs.board[(0, 3)] = Piece("MI", 0)    # unmoved: pawn double-step
+        tos = {m.to for m in gs.legal_moves((0, 3))}
+        self.assertEqual(tos, {(0, 2), (1, 2), (0, 1), (2, 1)})
+        gs.board[(0, 3)].moved = True
+        tos = {m.to for m in gs.legal_moves((0, 3))}
+        self.assertEqual(tos, {(0, 2), (1, 2)})
+
+    def test_pawn_mimic_threatens_by_its_owners_seat(self):
+        gs = self.gs
+        # player 1 sits on edge 3: capture diags (-1,2), (1,1), (-2,1).
+        # From (-4,-1), the (-2,1) diagonal hits K0 on (-6,0).
+        gs.mimic_type = "P"
+        gs.board[(-4, -1)] = Piece("MI", 1)
+        self.assertTrue(gs.king_in_danger(0))
+        self.assertTrue(gs._king_in_danger_scan(0))
+        # ...whereas a pawn-mimic OWNED BY PLAYER 0 there aims the other way
+        gs.board[(-4, -1)] = Piece("MI", 0)
+        self.assertFalse(gs.king_in_danger(0))
+        self.assertFalse(gs._king_in_danger_scan(0))
+        # and a thief-mimic threatens nothing at all
+        gs.board[(-4, -1)] = Piece("MI", 1)
+        gs.mimic_type = "TF"
+        self.assertFalse(gs.king_in_danger(0))
+        self.assertFalse(gs._king_in_danger_scan(0))
+
+    def test_mimic_as_slider_checks_the_king(self):
+        gs = self.gs
+        gs.board[(-6, 3)] = Piece("MI", 1)   # rook-lined up with K0
+        for mt, danger in (("R", True), ("B", False), ("N", False),
+                           ("Q", True), ("TF", False), ("P", False)):
+            gs.mimic_type = mt
+            self.assertEqual(gs.king_in_danger(0), danger, mt)
+            self.assertEqual(gs._king_in_danger_scan(0), danger, mt)
+
+
+class TestMoveArgV5(unittest.TestCase):
+    """V5.1: Move gained an optional `arg` with full value semantics."""
+
+    def test_kinds_gained_swap_and_morph(self):
+        self.assertIn("swap", engine.MOVE_KINDS)
+        self.assertIn("morph", engine.MOVE_KINDS)
+
+    def test_arg_serializes_only_when_set(self):
+        m = Move((2, 3), (2, 3), "morph", "Q")
+        d = m.to_dict()
+        self.assertEqual(d, {"from": [2, 3], "to": [2, 3],
+                             "kind": "morph", "arg": "Q"})
+        self.assertEqual(Move.from_dict(json.loads(json.dumps(d))), m)
+        plain = Move((0, 0), (1, 0))
+        self.assertNotIn("arg", plain.to_dict())
+        self.assertEqual(Move.from_dict(plain.to_dict()), plain)
+        # pre-v5 dicts (no "arg" key) still parse, with arg=None
+        old = Move.from_dict({"from": [0, 0], "to": [1, 0], "kind": "move"})
+        self.assertIsNone(old.arg)
+        self.assertEqual(old, plain)
+
+    def test_arg_in_eq_and_hash(self):
+        a = Move((0, 0), (0, 0), "morph", "Q")
+        b = Move((0, 0), (0, 0), "morph", "Q")
+        c = Move((0, 0), (0, 0), "morph", "N")
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+        self.assertNotEqual(a, c)
+        self.assertNotEqual(a, Move((0, 0), (0, 0), "morph"))
+        self.assertEqual(len({a, b, c}), 2)
+
+    def test_malformed_args_rejected(self):
+        Move.from_dict({"from": [0, 0], "to": [0, 2], "kind": "swap"})  # ok
+        for bad_arg in (7, ["Q"], {"t": "Q"}, True):
+            with self.assertRaises(ValueError, msg=bad_arg):
+                Move.from_dict({"from": [0, 0], "to": [0, 0],
+                                "kind": "morph", "arg": bad_arg})
+        with self.assertRaises(ValueError):
+            Move.from_dict({"from": [0, 0], "to": [0, 0], "kind": "bogus"})
+
+
 class TestFuzz(unittest.TestCase):
     def test_random_playouts_hold_invariants(self):
         rng = random.Random(1234)
@@ -1391,6 +1914,59 @@ class TestFuzz(unittest.TestCase):
                     json.loads(json.dumps(gs.to_dict())))
                 self.assertEqual(rt.shape, shape)
                 self.assertEqual(rt.to_dict(), gs.to_dict())
+
+    def test_random_playouts_with_v5_swaps(self):
+        """V5: games with TF/SH/MI swapped in — the fast reverse attack
+        test must keep agreeing with the slow pseudo-move scan (the ground
+        truth for mimic/shaman/thief threat), swaps and morphs included."""
+        rng = random.Random(52025)
+        swaps = {"R": "TF", "NE": "SH", "B": "MI"}
+        kinds_seen = set()
+        for n in (2, 3, 6):
+            gs = GameState.new_game([(i, "P%d" % i) for i in range(n)],
+                                    swaps=swaps)
+            cells = engine.board_cells(gs.radius)
+            for _ply in range(300):
+                if gs.winner is not None:
+                    break
+                mover = gs.turn_pid
+                all_mv = gs.all_legal_moves(mover)
+                self.assertTrue(all_mv)
+                special = [m for m in all_mv
+                           if m.kind in ("swap", "morph")]
+                if special and rng.random() < 0.35:
+                    mv = rng.choice(special)
+                else:
+                    mv = rng.choice(all_mv)
+                kinds_seen.add(mv.kind)
+                ok, err = gs.apply_move(mover, mv)
+                self.assertTrue(ok, err)
+                self.assertIn(gs.mimic_type, engine.PIECE_NAMES)
+                self.assertNotEqual(gs.mimic_type, "MI")
+                for c, pc in gs.board.items():
+                    self.assertIn(c, cells)
+                    self.assertTrue(gs._is_alive(pc.owner))
+                    self.assertIn(pc.type, engine.PIECE_NAMES)
+                for types in gs.lost.values():
+                    for t in types:
+                        self.assertIn(t, engine.PIECE_NAMES)
+                if gs.winner is None:
+                    self.assertTrue(gs._is_alive(gs.turn_pid))
+                if _ply % 5 == 0:
+                    # differential king-danger check: the fast reverse
+                    # attack test IS defined by the pseudo-move scan
+                    for p in gs.players:
+                        if p["alive"]:
+                            self.assertEqual(
+                                gs.king_in_danger(p["pid"]),
+                                gs._king_in_danger_scan(p["pid"]),
+                                "attack-test divergence n=%d ply=%d pid=%d"
+                                % (n, _ply, p["pid"]))
+                rt = GameState.from_dict(
+                    json.loads(json.dumps(gs.to_dict())))
+                self.assertEqual(rt.to_dict(), gs.to_dict())
+        self.assertIn("swap", kinds_seen)    # thieves actually swapped
+        self.assertIn("morph", kinds_seen)   # shamans actually morphed
 
     def test_random_playouts_with_raises_and_graves(self):
         """V4: games featuring necromancer raises (SK on the board) and a
