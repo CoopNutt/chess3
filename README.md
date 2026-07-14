@@ -1,105 +1,64 @@
-# CHESS 3
+# Chess 3
 
-Battle chess for **2–6 players** over the network: 4 board shapes, 14 new
-troops, timers, themes, sounds, LAN invites, and lobby-code multiplayer.
-Free-for-all — capture a King to eliminate that player. Last one standing wins.
+Multiplayer battle chess for 2 to 6 players. Pick a map, build your army,
+send your friends a lobby code and fight until one king is left standing.
 
-## Play
+Download the latest Chess3.exe from the releases page. No install, just run it.
 
-Run `Chess3.exe` (or `python main.py`).
+## How to play
 
-**Hosting:** click HOST GAME. You'll get two lobby codes:
-- **Same-WiFi code** — works for anyone on your network.
-- **Internet code** — works from anywhere *if* the auto port-forward succeeded
-  (the lobby tells you). If it failed: port-forward TCP 47733 on your router,
-  or everyone installs Radmin VPN and friends join with `your-radmin-ip:47733`.
+Host a game and you get two codes. The wifi code works for anyone on your
+network, the internet code works anywhere if the auto port forward succeeded
+(the lobby tells you). Friends open the game, hit join and type the code.
+People running the game on your network show up as online and you can invite
+them directly, they get a popup with an accept button.
 
-Pick your **match settings** in the lobby (click to change):
-- **Map**: Hexagon (2–6p), Octagon (2–6p), Square (2–4p), Triangle (2–3p)
-- **Move time**: off / 15s / 30s / 60s / 120s — run out and your turn is skipped
-- **Game time**: off / 5 / 10 / 20 / 30 min — when it ends, most troops wins
-- **Troop swaps**: swap Catapult / Valkyrie / Golem in for any default troop
+Match settings are picked by the host in the lobby:
 
-Click START GAME once at least 2 players are in.
+- Map: hexagon, octagon, square or triangle
+- Move timer and total game clock
+- Troop swaps, put Catapults, Valkyries, Golems, Juggernauts, Snipers or
+  Wardens in your army in place of the default troops
 
-**Joining:** click JOIN GAME and type the code (recent lobbies get one-click
-rejoin buttons). **Friends:** the FRIENDS screen remembers everyone you play
-with; star the ones you like.
+## Rules
 
-## The troops
+No checkmate, you have to actually capture the king. You also cannot make a
+move that would leave your own king open to capture, same as regular chess.
+Lose your king and your whole army is gone, but you get one last act of
+revenge: curse any empty tile into a graveyard that nothing can enter except
+skeletons.
 
-| Troop | Power |
+Pawns move 1 forward (2 on their first move), capture on the three forward
+diagonals and become queens on the far side of the board. Press H in game to
+see how every troop moves, each one has a picture.
+
+Some troop highlights:
+
+| Troop | What it does |
 |---|---|
-| **Cannon** | Rolls straight; kills by hopping over exactly one piece |
-| **Archer** | Snipes enemies exactly 2 tiles away without moving |
-| **Wizard** | Teleports anywhere within 2 tiles — walls don't matter |
-| **Dragon** | Flies like a Queen, up to 3 tiles |
-| **Champion** | Leaps 1–2 straight or 1 diagonal, clean over blockers |
-| **Bomber** | Explodes when it captures *or* dies — chain reactions! |
-| **Ghost** | Drifts up to 3 tiles diagonally, straight *through* pieces |
-| **Necromancer** | Raises your dead pawns back onto the board |
-| **Catapult** *(swap-in)* | Hurls boulders at enemies exactly 3 tiles away |
-| **Valkyrie** *(swap-in)* | Knight jumps + diagonal slips |
-| **Golem** *(swap-in)* | Immune to arrows, boulders and explosions |
-| **Juggernaut** *(swap-in)* | Charges up to 5 tiles — hits the first thing in its path |
-| **Sniper** *(swap-in)* | Diagonal marksman, shoots 2 tiles over anything |
-| **Warden** *(swap-in)* | Protective aura: neighbors can't be captured by moves |
+| Cannon | Kills by leaping over exactly one piece |
+| Archer | Shoots enemies 2 tiles away without moving |
+| Wizard | Teleports within 2 tiles, strikes like lightning |
+| Dragon | Flies up to 3 tiles, breathes fire when it lands on someone |
+| Bomber | Explodes when it captures or dies. Also explodes by itself after 10 moves |
+| Ghost | Slides through other pieces |
+| Necromancer | Raises skeletons from your dead pawns, they crumble after 3 moves |
+| Juggernaut | Charges up to 5 tiles and hits the first thing in its path |
+| Warden | Pieces next to it cannot be captured by normal moves |
+| Golem | Immune to arrows, boulders and explosions |
 
-Press **H** anytime — every troop has a movement picture.
+Heavy hits crack the tiles permanently. Right click draws planning arrows
+like chess.com. Select any piece to see its moves, what it can take and what
+it protects.
 
-## v4 goodies
+## Building from source
 
-- **Every troop moves in its own style**: the Juggernaut accelerates with a
-  smoke trail, the Wizard phases in with a lightning strike, the Dragon flies
-  up and slams down breathing fire, the Champion dashes with afterimages, the
-  Valkyrie spins in a whirlwind, ghosts turn translucent... and heavy impacts
-  **permanently crack the tiles** they hit.
-- **Skeletons**: the Necromancer now raises skeletons — they fight like pawns
-  but crumble to dust after 3 moves (watch their little green pips).
-- **Bomber fuse**: bombers detonate automatically on their 10th move. Plan
-  accordingly.
-- **Graveyard curse**: when you're eliminated you get one act of revenge —
-  click any empty tile to blacken it with a tombstone. Nothing can ever stand
-  there again... except skeletons.
-- **Auto-updates**: the game checks GitHub on startup and offers one-click
-  update & restart when a new release is out.
-
-## v3 goodies
-
-- **Zoom & pan**: mouse wheel zooms, right/middle-drag pans, **R** resets.
-- **Select any piece** (even an enemy's) to preview its moves; everything it
-  could capture glows red.
-- **Sounds**: your-turn chime, captures, explosions, victory — toggle and
-  volume in SETTINGS (plus fullscreen).
-- **LAN invites**: friends running Chess 3 on your network (or a shared
-  Radmin/Hamachi VPN) show up "online" — hit INVITE while hosting and a
-  Steam-style card pops up at their bottom-right with an ACCEPT button.
-
-## Rules quick sheet
-
-- No check or checkmate — you must actually capture the King.
-- Lose your King and you're out; your army vanishes. Kings and Golems survive
-  explosions.
-- On your turn, enemies you can capture glow **red**.
-- Pawns step 1 forward (2 on their first move), kill on the 3 forward
-  diagonals, auto-promote to Queen on far edges.
-- Every start position is machine-verified **quiet** — no first-move snipes,
-  on every map shape, even with swaps.
-- Disconnect or run out the clock too often and you're skipped/eliminated.
-- 5 themes (menu → THEME button): Classic, Midnight, Forest, Ember, Ice.
-
-## Building the exe
+Python 3.12+ with pygame-ce and numpy, then:
 
 ```
 build.bat
 ```
 
-Produces `dist\Chess3.exe` — a single file you can send to friends.
+Tests: `python -m unittest discover -s tests`
 
-## Dev
-
-- Python 3.14 + pygame-ce. `engine.py` (rules) and `net.py` (netcode) have no
-  pygame dependency; `diagrams.py` renders the help pictures from real movegen.
-- Tests: `python -m unittest discover -s tests -v` (88 tests).
-- Board layouts/sizes are machine-searched for quiet starts:
-  `python scripts\search_layouts.py`.
+The game updates itself, when a new release is out it asks before restarting.

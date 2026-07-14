@@ -605,18 +605,29 @@ class GameState:
                 return True
         return False
 
-    def legal_moves(self, cell):
-        """All legal moves for the piece on `cell`.
-
-        Returns [] if there is no piece, its owner is dead, or the game is
-        over.  Does not depend on whose turn it is (apply_move checks that).
-        """
+    def _pseudo_moves(self, cell):
+        """Movement-rule moves for the piece on `cell`, WITHOUT the
+        king-safety filter. This is what attack computations use (a pinned
+        piece still threatens, exactly like classic chess)."""
         if self.winner is not None:
             return []
         pc = self.board.get(cell)
         if pc is None or not self._is_alive(pc.owner):
             return []
         return self._GEN[pc.type](self, cell, pc)
+
+    def legal_moves(self, cell):
+        """All legal moves for the piece on `cell`.
+
+        Returns [] if there is no piece, its owner is dead, or the game is
+        over.  Does not depend on whose turn it is (apply_move checks that).
+        You may never play a move that leaves YOUR OWN king capturable.
+        """
+        pc = self.board.get(cell)
+        moves = self._pseudo_moves(cell)
+        if not moves:
+            return moves
+        return [m for m in moves if not self._exposes_king(pc.owner, m)]
 
     def all_legal_moves(self, pid):
         """Every legal move available to player `pid` right now."""
@@ -627,6 +638,68 @@ class GameState:
             if pc.owner == pid:
                 moves.extend(self.legal_moves(cell))
         return moves
+
+    # -- king-safety simulation ----------------------------------------------
+
+    def _sim_explosion(self, center, removed):
+        """Explosion at `center` on the scratch board: record removals in
+        `removed` and chain into other bombers. Kings and Golems survive."""
+        queue = deque([center])
+        while queue:
+            cq, cr = queue.popleft()
+            for dq, dr in ORTHO:
+                t = (cq + dq, cr + dr)
+                occ = self.board.get(t)
+                if occ is None or occ.type in ("K", "GO"):
+                    continue
+                removed[t] = self.board.pop(t)
+                if occ.type == "BM":
+                    queue.append(t)
+
+    def _exposes_king(self, pid, move):
+        """Would playing `move` leave pid's king attackable? Simulates the
+        move's direct effects (including bomber explosions) on the live board
+        dict and restores it exactly afterwards."""
+        removed = {}
+        added = []
+        board = self.board
+        try:
+            if move.kind == "shoot":
+                victim = board.get(move.to)
+                if victim is not None:
+                    removed[move.to] = board.pop(move.to)
+                    if victim.type == "BM":
+                        self._sim_explosion(move.to, removed)
+            elif move.kind == "raise":
+                board[move.to] = Piece("SK", pid, True)
+                added.append(move.to)
+            else:  # "move"
+                mover = board.get(move.from_)
+                if mover is None:
+                    return False
+                victim = board.get(move.to)
+                removed[move.from_] = board.pop(move.from_)
+                if victim is not None:
+                    removed[move.to] = victim
+                board[move.to] = mover
+                added.append(move.to)
+                explode_here = []
+                if victim is not None and victim.type == "BM":
+                    explode_here.append(move.to)
+                # a bomber that captures — or completes its 10th move —
+                # detonates and dies on arrival
+                if mover.type == "BM" and (victim is not None
+                                           or getattr(mover, "uses", 0) >= 9):
+                    del board[move.to]
+                    added.remove(move.to)
+                    explode_here.append(move.to)
+                for c in explode_here:
+                    self._sim_explosion(c, removed)
+            return self.king_in_danger(pid)
+        finally:
+            for c in added:
+                board.pop(c, None)
+            board.update(removed)
 
     def _slide(self, cell, owner, dirs, max_steps=None, capture=True):
         """Slide moves along `dirs`, stopping at the first occupied cell.
@@ -902,20 +975,150 @@ class GameState:
 
     # -- attacks ------------------------------------------------------------
 
-    def king_in_danger(self, pid):
-        """True if any living enemy piece can capture pid's king right now."""
-        kcell = None
+    def _find_king(self, pid):
         for c, pc in self.board.items():
             if pc.owner == pid and pc.type == "K":
-                kcell = c
-                break
+                return c
+        return None
+
+    def king_in_danger(self, pid):
+        """True if any living enemy piece can capture pid's king right now."""
+        kcell = self._find_king(pid)
+        return kcell is not None and self._cell_attacked(kcell, pid)
+
+    def _king_in_danger_scan(self, pid):
+        """Slow reference implementation: scan every enemy pseudo move.
+        Kept ONLY so tests can differentially verify _cell_attacked."""
+        kcell = self._find_king(pid)
         if kcell is None:
             return False
         for c, pc in list(self.board.items()):
             if pc.owner == pid or not self._is_alive(pc.owner):
                 continue
-            for mv in self.legal_moves(c):
+            for mv in self._pseudo_moves(c):
                 if mv.to == kcell and mv.kind != "raise":
+                    return True
+        return False
+
+    def _cell_attacked(self, kcell, pid):
+        """Fast reverse attack test: can any living enemy capture a `pid`
+        piece standing on `kcell`? Mirrors every piece's movement rules from
+        the target's point of view (differentially tested against the pseudo
+        move scan in the fuzz suite)."""
+        board = self.board
+        cells = self._cells
+        graves = self.graveyards
+
+        def enemy(pc):
+            return (pc is not None and pc.owner != pid
+                    and self._is_alive(pc.owner))
+
+        # A warden's aura stops kind="move" captures; shoots go through it.
+        shielded = self._protected(kcell, pid)
+
+        # --- ranged shots ignore blockers AND the aura ---
+        for dq, dr in ORTHO:
+            pc = board.get((kcell[0] + 2 * dq, kcell[1] + 2 * dr))
+            if enemy(pc) and pc.type == "AR":
+                return True
+            pc = board.get((kcell[0] + 3 * dq, kcell[1] + 3 * dr))
+            if enemy(pc) and pc.type == "CT":
+                return True
+        for dq, dr in DIAG:
+            pc = board.get((kcell[0] + 2 * dq, kcell[1] + 2 * dr))
+            if enemy(pc) and pc.type == "SN":
+                return True
+        if shielded:
+            return False
+
+        # --- ortho rays: sliders, chargers, and the cannon's screen-jump ---
+        jg_range = globals().get("JUGGERNAUT_RANGE", 5)
+        for dq, dr in ORTHO:
+            q, r = kcell
+            seen_screen = False
+            steps = 0
+            while steps < 4 * self.radius:
+                q += dq
+                r += dr
+                steps += 1
+                cell = (q, r)
+                if cell not in cells or cell in graves:
+                    break
+                pc = board.get(cell)
+                if pc is None:
+                    continue
+                if not seen_screen:
+                    if enemy(pc):
+                        t = pc.type
+                        if (t in ("R", "Q")
+                                or (t == "DR" and steps <= 3)
+                                or (t == "JG" and steps <= jg_range)
+                                or (t == "BM" and steps <= 2)
+                                or (steps == 1 and t in ("K", "GO", "WD",
+                                                         "CH"))):
+                            return True
+                    seen_screen = True
+                else:
+                    # second piece on the ray: only a cannon jumps the screen
+                    if enemy(pc) and pc.type == "CN":
+                        return True
+                    break
+
+        # --- diag rays: sliders (ghosts handled as jumps below) ---
+        for dq, dr in DIAG:
+            q, r = kcell
+            steps = 0
+            while steps < 4 * self.radius:
+                q += dq
+                r += dr
+                steps += 1
+                cell = (q, r)
+                if cell not in cells or cell in graves:
+                    break
+                pc = board.get(cell)
+                if pc is None:
+                    continue
+                if enemy(pc):
+                    t = pc.type
+                    if (t in ("B", "Q")
+                            or (t == "DR" and steps <= 3)
+                            or (steps == 1 and t in ("K", "NE", "VA", "WD",
+                                                     "CH"))):
+                        return True
+                break
+
+        # --- jumps that ignore blockers ---
+        for dq, dr in KNIGHT:
+            pc = board.get((kcell[0] + dq, kcell[1] + dr))
+            if enemy(pc) and pc.type in ("N", "VA"):
+                return True
+        for dq, dr in ORTHO:  # champion's 2-step ortho leap
+            pc = board.get((kcell[0] + 2 * dq, kcell[1] + 2 * dr))
+            if enemy(pc) and pc.type == "CH":
+                return True
+        for dq, dr in DIAG:   # ghosts phase through anything within range
+            for k in range(1, GHOST_RANGE + 1):
+                pc = board.get((kcell[0] + k * dq, kcell[1] + k * dr))
+                if enemy(pc) and pc.type == "GH":
+                    return True
+        for dq in range(-2, 3):  # wizard teleports within 2
+            for dr in range(-2, 3):
+                if 1 <= (abs(dq) + abs(dr) + abs(dq + dr)) // 2 <= 2:
+                    pc = board.get((kcell[0] + dq, kcell[1] + dr))
+                    if enemy(pc) and pc.type == "WZ":
+                        return True
+
+        # --- pawns and skeletons: their 3 forward capture diagonals ---
+        for p in self.players:
+            if p["pid"] == pid or not p["alive"]:
+                continue
+            f1, f2 = shape_edge_forward(self.shape, p["seat"])
+            for cap in ((f1[0] + f2[0], f1[1] + f2[1]),
+                        (2 * f1[0] - f2[0], 2 * f1[1] - f2[1]),
+                        (2 * f2[0] - f1[0], 2 * f2[1] - f1[1])):
+                pc = board.get((kcell[0] - cap[0], kcell[1] - cap[1]))
+                if (pc is not None and pc.owner == p["pid"]
+                        and pc.type in ("P", "SK")):
                     return True
         return False
 

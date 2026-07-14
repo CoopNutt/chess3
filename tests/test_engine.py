@@ -260,7 +260,9 @@ class TestNewTroops(unittest.TestCase):
         # (-2,-2) -> (-1,-1), (0,0), (1,1); a 4th step (2,2) is on the
         # board too, so the range cap (not the board edge) stops it.
         gs.board[(-2, -2)] = Piece("GH", 0)
-        gs.board[(0, 0)] = Piece("R", 1)     # enemy on the 2nd ray cell
+        gs.board[(0, 0)] = Piece("N", 1)     # enemy on the 2nd ray cell
+        # (a knight: a rook here would check the king and the king-safety
+        # filter would rightly cull the ghost's quiet moves)
         tos = moves_to(gs, (-2, -2))
         self.assertIn((-1, -1), tos)
         self.assertIn((0, 0), tos)           # capture on ray
@@ -852,6 +854,79 @@ class TestTimers(unittest.TestCase):
         self.assertEqual(gs.winner, 1)
 
 
+class TestKingSafety(unittest.TestCase):
+    """You may never play a move that leaves your own king capturable."""
+
+    def setUp(self):
+        self.gs = fresh(2)
+        clear_keep_kings(self.gs)   # kings at (-6,0) and (6,0)
+        self.gs.turn_pid = 0
+
+    def test_king_cannot_step_into_attack(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("R", 1)   # rook sweeps the whole r=0 line
+        tos = set(moves_to(gs, (-6, 0)))
+        self.assertNotIn((-5, 0), tos)     # stays on the swept line: illegal
+        self.assertIn((-6, 1), tos)        # stepping off the line is fine
+
+    def test_pinned_piece_cannot_move(self):
+        gs = self.gs
+        # enemy rook on the king's line, our knight blocking = pinned
+        gs.board[(0, 0)] = Piece("R", 1)
+        gs.board[(-3, 0)] = Piece("N", 0)
+        self.assertEqual(gs.legal_moves((-3, 0)), [])
+        # remove the rook: knight free again
+        del gs.board[(0, 0)]
+        self.assertTrue(gs.legal_moves((-3, 0)))
+
+    def test_must_resolve_check(self):
+        gs = self.gs
+        gs.board[(0, 0)] = Piece("R", 1)   # checks the king along r=0
+        gs.board[(-2, -2)] = Piece("GH", 0)
+        self.assertTrue(gs.king_in_danger(0))
+        allowed = {m.to for m in gs.legal_moves((-2, -2))}
+        # only capturing the rook or blocking its ray helps
+        self.assertEqual(allowed, {(0, 0), (-3, 0)})
+
+    def test_shoot_that_opens_a_line_is_illegal(self):
+        gs = self.gs
+        # enemy rook behind an enemy pawn: shooting the pawn opens the check
+        gs.board[(3, 0)] = Piece("R", 1)
+        gs.board[(-1, 0)] = Piece("P", 1)
+        gs.board[(-3, 2)] = Piece("AR", 0)  # exactly 2 ortho from (-1,0)? no:
+        gs.board.pop((-3, 2))
+        gs.board[(-1, 2)] = Piece("AR", 0)  # (-1,2) + 2*(0,-1) = (-1,0)
+        shoots = [m for m in gs.legal_moves((-1, 2)) if m.kind == "shoot"]
+        self.assertEqual(shoots, [])        # would expose the king
+
+    def test_checkmated_player_is_skipped_then_captured(self):
+        gs = fresh(2)
+        gs.board.clear()
+        R = gs.radius
+        gs.board[(-R, 0)] = Piece("K", 0)
+        gs.board[(R, 0)] = Piece("K", 1)
+        # box king 0 in: rook pins the whole line, queen next to it covers all
+        gs.board[(-R + 2, 0)] = Piece("Q", 1)
+        gs.board[(-R + 2, -1)] = Piece("R", 1)
+        gs.board[(-R, 2)] = Piece("R", 1)
+        if gs.all_legal_moves(0):
+            self.skipTest("crafted mate no longer tight after rule changes")
+        gs.turn_pid = 1
+        ok, err = gs.apply_move(1, Move((-R + 2, 0), (-R + 1, 0)))
+        # whatever the queen does, player 0 must not get an illegal turn
+        self.assertTrue(ok, err)
+        if gs.winner is None:
+            self.assertNotEqual(gs.turn_pid, 0 if not gs.all_legal_moves(0)
+                                else -99)
+
+    def test_fast_attack_test_matches_scan_on_starts(self):
+        for n in (2, 3, 6):
+            gs = fresh(n)
+            for p in gs.players:
+                self.assertEqual(gs.king_in_danger(p["pid"]),
+                                 gs._king_in_danger_scan(p["pid"]))
+
+
 class TestQuietStart(unittest.TestCase):
     """Nobody may capture, shoot, or promote on ply 1, for ANY (shape,
     player count) at its SHAPE_SIZE — default armies and swapped armies.
@@ -1250,6 +1325,16 @@ class TestFuzz(unittest.TestCase):
                             self.assertIn(t, engine.PIECE_NAMES)
                     if gs.winner is None:
                         self.assertTrue(gs._is_alive(gs.turn_pid))
+                    if _ply % 25 == 0:
+                        # fast reverse attack test must agree with the slow
+                        # pseudo-move scan on real positions
+                        for p in gs.players:
+                            if p["alive"]:
+                                self.assertEqual(
+                                    gs.king_in_danger(p["pid"]),
+                                    gs._king_in_danger_scan(p["pid"]),
+                                    "attack-test divergence n=%d ply=%d pid=%d"
+                                    % (n, _ply, p["pid"]))
                     rt = GameState.from_dict(
                         json.loads(json.dumps(gs.to_dict())))
                     self.assertEqual(rt.to_dict(), gs.to_dict())

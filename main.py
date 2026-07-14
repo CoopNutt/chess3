@@ -90,7 +90,7 @@ set_theme("Classic")
 
 CFG_PATH = Path.home() / ".chess3.json"
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 # Per-troop movement animation profiles.
 #   dur: seconds  |  ease: out / in_expo (accelerate) / steps (fast increments)
@@ -323,6 +323,10 @@ class BoardView:
         self.particles = []         # transient effect particles
         self.projectile = None      # arrow / cannonball in flight
         self.shake_t0 = 0.0         # board shake on slams/explosions
+        self.arrows = []            # [(from_cell, to_cell)] planning arrows
+        self.marks = set()          # right-clicked highlight tiles
+        self.arrow_anchor = None    # right-drag in progress
+        self.protect_cells = set()  # friendlies guarded by the selection
         self._t2d = {}           # true cell -> display cell (orientation)
         self._d2t = {}
 
@@ -359,11 +363,13 @@ class BoardView:
 
     def select_cell(self, cell):
         """Select any piece (yours or an enemy's) to preview its moves;
-        capture/shoot targets of the SELECTION are the red danger tiles."""
+        capture/shoot targets of the SELECTION are the red danger tiles and
+        friendly pieces it guards get the theme-colored protection tint."""
         self.selected = None
         self.legal = {}
         self.legal_clickable = False
         self.danger_cells = set()
+        self.protect_cells = set()
         if cell is None or self.state is None:
             return
         pc = self.state.board.get(cell)
@@ -379,6 +385,58 @@ class BoardView:
         self.danger_cells = {to for to, mv in self.legal.items()
                              if mv.kind == "shoot"
                              or (mv.kind == "move" and to in gs.board)}
+        try:
+            self.protect_cells = self._compute_protected(cell, pc)
+        except Exception:
+            self.protect_cells = set()
+
+    def _compute_protected(self, cell, pc):
+        """Friendly-occupied tiles this piece guards: if the piece standing
+        there were an enemy, could the selection capture or shoot it?
+        (Checked with pseudo moves — a bodyguard doesn't stop guarding just
+        because he's pinned.)"""
+        gs = self.state
+        out = set()
+        enemy_pid = next((p["pid"] for p in gs.players
+                          if p["pid"] != pc.owner), pc.owner + 1)
+        for t, f in list(gs.board.items()):
+            if f.owner != pc.owner or t == cell:
+                continue
+            if engine.hex_dist(cell, t) > 6:
+                continue
+            saved = gs.board[t]
+            gs.board[t] = engine.Piece(f.type, enemy_pid, True)
+            try:
+                if any(mv.to == t and mv.kind in ("move", "shoot")
+                       for mv in gs._pseudo_moves(cell)):
+                    out.add(t)
+            finally:
+                gs.board[t] = saved
+        return out
+
+    # ---- planning arrows & marks (right-click, chess.com style) ----
+
+    def begin_arrow(self, pos):
+        self.arrow_anchor = self.px_to_cell(pos)
+
+    def end_arrow(self, pos):
+        a, self.arrow_anchor = self.arrow_anchor, None
+        b = self.px_to_cell(pos)
+        if a is None or b is None:
+            return
+        if a == b:
+            self.marks.symmetric_difference_update({a})
+        else:
+            arrow = (a, b)
+            if arrow in self.arrows:
+                self.arrows.remove(arrow)
+            else:
+                self.arrows.append(arrow)
+
+    def clear_annotations(self):
+        self.arrows = []
+        self.marks = set()
+        self.arrow_anchor = None
 
     def _compute_edge_cells(self, me):
         self.my_edge_cells = set()
@@ -803,11 +861,20 @@ class BoardView:
             if cell in self.last_cells:
                 shade = tuple(int(s * 0.6 + t * 0.4)
                               for s, t in zip(shade, LASTMOVE_TINT))
+            if cell in self.protect_cells:
+                shade = tuple(int(s * 0.45 + t * 0.55)
+                              for s, t in zip(shade, ACCENT))
             if cell in self.danger_cells:
                 shade = tuple(int(s * 0.45 + t * 0.55)
                               for s, t in zip(shade, DANGER_TINT))
+            if cell in self.marks:
+                shade = tuple(int(s * 0.5 + t * 0.5)
+                              for s, t in zip(shade, ACCENT))
             pts = self.hex_points((cx, cy), 0.985)
             pygame.draw.polygon(surf, shade, pts)
+            if cell in self.marks:
+                pygame.draw.polygon(surf, ACCENT,
+                                    self.hex_points((cx, cy), 0.9), 3)
             if cell in self.cracked and hasattr(icons, "draw_cracks"):
                 icons.draw_cracks(surf, cell, (int(cx), int(cy)), int(self.s))
             if cell in self.danger_cells:
@@ -887,6 +954,32 @@ class BoardView:
                 col = (255, int(180 * (1 - t)) + 60, 60)
                 pygame.draw.circle(surf, col, (int(cx), int(cy)), int(alpha_r), 3)
         self.flashes = keep
+
+        # planning arrows on top of everything (semi-transparent theme color)
+        pending = ([(self.arrow_anchor, self.px_to_cell(mouse))]
+                   if self.arrow_anchor is not None else [])
+        if self.arrows or pending:
+            ov = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
+            acol = (*ACCENT, 185)
+            for a, b in self.arrows + pending:
+                if a is None or b is None or a == b:
+                    continue
+                ax, ay = self.cell_to_px(a)
+                bx, by = self.cell_to_px(b)
+                ang = math.atan2(by - ay, bx - ax)
+                head = self.s * 0.62
+                ex = bx - math.cos(ang) * head * 0.7
+                ey = by - math.sin(ang) * head * 0.7
+                pygame.draw.line(ov, acol, (ax, ay), (ex, ey),
+                                 max(4, int(self.s * 0.24)))
+                pygame.draw.polygon(ov, acol, [
+                    (bx, by),
+                    (bx - math.cos(ang - 0.5) * head,
+                     by - math.sin(ang - 0.5) * head),
+                    (bx - math.cos(ang + 0.5) * head,
+                     by - math.sin(ang + 0.5) * head)])
+            surf.blit(ov, (0, 0))
+
         # restore un-shaken origin so hit-testing stays stable
         self.origin = base_origin
 
@@ -938,6 +1031,7 @@ class App:
             self._apply_fullscreen(True, save=False)
         self.update_info = None       # newer release found on GitHub
         self.update_status = ""       # "" | downloading text
+        self.pending_move = None      # awaiting CONFIRM (settings toggle)
         self._check_updates()
         self.server = None
         self.client = None
@@ -1065,11 +1159,14 @@ class App:
         snd = self.cfg.get("sound_on", True)
         vol = self.cfg.get("volume", 0.7)
         vol_name = "Low" if vol < 0.45 else ("Medium" if vol < 0.85 else "High")
+        confirm = self.cfg.get("confirm_moves", False)
         rows = [
             ("DISPLAY", "Fullscreen" if fs else "Windowed", self._toggle_fullscreen),
             ("SOUND", "On" if snd else "Off", self._toggle_sound),
             ("VOLUME", vol_name, self._cycle_volume),
             ("THEME", CURRENT_THEME, self.cycle_theme),
+            ("CONFIRM MOVES", "On" if confirm else "Off",
+             self._toggle_confirm_moves),
         ]
         out = []
         y = H // 2 - 120
@@ -1098,6 +1195,10 @@ class App:
         sounds.set_volume(nxt)
         save_cfg(self.cfg)
         sounds.play("turn")
+
+    def _toggle_confirm_moves(self):
+        self.cfg["confirm_moves"] = not self.cfg.get("confirm_moves", False)
+        save_cfg(self.cfg)
 
     def draw_settings(self, mouse):
         W, H = self.win.get_size()
@@ -1427,6 +1528,7 @@ class App:
         elif t == "state":
             sd = ev["state"]
             sd["_last_move"] = ev.get("last_move")
+            self.pending_move = None   # the world moved on; re-pick
             self.board.set_state(sd, self.my_pid())
             self._set_clock(ev.get("clock"))
             self._state_sounds(sd, ev.get("last_move"))
@@ -1560,7 +1662,9 @@ class App:
                     if self.help_open:
                         self.help_open = False
                     elif self.screen == "GAME":
-                        if now - self.esc_at < 2.0:
+                        if self.pending_move is not None:
+                            self.pending_move = None
+                        elif now - self.esc_at < 2.0:
                             self.cleanup_net()
                             self.screen = "MENU"
                         else:
@@ -1576,14 +1680,21 @@ class App:
                         self.help_scroll = max(0, self.help_scroll - ev.y * 60)
                     elif self.screen == "GAME":
                         self.board.zoom_at(mouse, 1.15 ** ev.y)
-                elif (ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (2, 3)
+                elif (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 2
                         and self.screen == "GAME" and not self.help_open):
                     self._panning = True
-                elif ev.type == pygame.MOUSEBUTTONUP and ev.button in (2, 3):
+                elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 2:
                     self._panning = False
                 elif (ev.type == pygame.MOUSEMOTION and self._panning
                         and self.screen == "GAME"):
                     self.board.pan_by(*ev.rel)
+                elif (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 3
+                        and self.screen == "GAME" and not self.help_open
+                        and self.board.area.collidepoint(ev.pos)):
+                    self.board.begin_arrow(ev.pos)
+                elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 3:
+                    if self.board.arrow_anchor is not None:
+                        self.board.end_arrow(ev.pos)
                 elif (ev.type == pygame.KEYDOWN and ev.key == pygame.K_r
                         and self.screen == "GAME" and not self._typing()):
                     self.board.reset_view()
@@ -1699,6 +1810,14 @@ class App:
                 if self._help_btn().hit(ev.pos):
                     self.help_open = True
                     return
+                if self.pending_move is not None:
+                    for key, b in self._confirm_buttons():
+                        if b.hit(ev.pos):
+                            if key == "yes":
+                                self.submit_move(self.pending_move)
+                            self.pending_move = None
+                            return
+                self.board.clear_annotations()
                 # zoomed cells can extend under the HUD panels — only clicks
                 # inside the board area may reach the board
                 if not self.board.area.collidepoint(ev.pos):
@@ -1707,7 +1826,11 @@ class App:
                     return
                 mv = self.board.click(ev.pos)
                 if mv is not None:
-                    self.submit_move(mv)
+                    if self.cfg.get("confirm_moves", False):
+                        self.pending_move = mv
+                        self.board.last_cells = [mv.from_, mv.to]
+                    else:
+                        self.submit_move(mv)
 
     # ---------- screens ----------
 
@@ -2147,6 +2270,14 @@ class App:
         W, _ = self.win.get_size()
         return Button("?", (W - 54, 12, 40, 40), color=(120, 126, 140), sz=22)
 
+    def _confirm_buttons(self):
+        area = self.board.area
+        cx = area.centerx
+        y = area.bottom - 64
+        return [("yes", Button("CONFIRM", (cx - 150, y, 140, 44), color=GOOD)),
+                ("no", Button("CANCEL", (cx + 10, y, 140, 44),
+                              color=(120, 126, 140)))]
+
     def _gameover_button(self):
         W, H = self.win.get_size()
         return Button("BACK TO MENU", (W // 2 - 140, H // 2 + 70, 280, 52))
@@ -2222,6 +2353,11 @@ class App:
             pygame.draw.rect(self.win, col, (0, 0, W, H), 6)
             draw_text(self.win, "YOUR KING IS IN DANGER!", (W // 2, H - bot_h - 12), 20,
                       col, bold=True, center=True)
+
+        # pending-move confirmation (settings > CONFIRM MOVES)
+        if self.pending_move is not None:
+            for _key, b in self._confirm_buttons():
+                b.draw(self.win, mouse)
 
         # move timer (under the turn banner)
         mv_left = self.clock_left("move_left")
