@@ -43,6 +43,60 @@ INK = (25, 25, 30)
 #   glyph : glyph fill color
 STYLE = {"rim": None, "glow": None, "ink": INK, "glyph": GLYPH}
 
+# ---------------------------------------------------------------------------
+# Custom art (see ART_GUIDE.md): drop assets/pieces/<TYPE>.png next to the
+# exe (or this file when running from source) and it replaces that piece's
+# vector glyph. Missing/broken files silently fall back to the vectors.
+# ---------------------------------------------------------------------------
+
+
+def _art_dir():
+    import sys
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "assets", "pieces")
+
+
+_art_base = {}     # ptype -> Surface | None (loaded once per run)
+_art_scaled = {}   # (ptype, radius) -> Surface
+
+
+def _get_art(ptype, radius):
+    """Custom art for `ptype` scaled to fit a disc of radius `radius`,
+    or None when there is no art. Never raises."""
+    if ptype not in _art_base:
+        surf = None
+        try:
+            path = os.path.join(_art_dir(), "%s.png" % ptype)
+            if os.path.isfile(path):
+                surf = pygame.image.load(path)
+                try:
+                    surf = surf.convert_alpha()
+                except pygame.error:
+                    pass    # no display yet: use the raw surface
+        except Exception:
+            surf = None
+        _art_base[ptype] = surf
+    base = _art_base[ptype]
+    if base is None:
+        return None
+    key = (ptype, int(radius))
+    if key not in _art_scaled:
+        box = max(6, int(radius * 1.56))
+        try:
+            _art_scaled[key] = pygame.transform.smoothscale(base, (box, box))
+        except Exception:
+            return None
+    return _art_scaled[key]
+
+
+def clear_art_cache():
+    """Forget loaded art (mainly for tests)."""
+    _art_base.clear()
+    _art_scaled.clear()
+
 # Reset values used when set_style() is passed an explicit None.
 _STYLE_DEFAULTS = {"rim": None, "glow": None, "ink": INK, "glyph": GLYPH}
 
@@ -671,8 +725,14 @@ def draw_piece(surface, ptype, body_color, size, center):
     hi_rect.center = (cx - int(round(R * 0.34)), cy - int(round(R * 0.40)))
     pygame.draw.ellipse(surface, _lighten(body, 0.45), hi_rect)
 
-    # glyph
-    _GLYPHS[ptype](surface, cx, cy, R * 0.68, ow)
+    # glyph: custom art (assets/pieces/<type>.png next to the exe) wins,
+    # the built-in vector glyph is the fallback
+    art = _get_art(ptype, R)
+    if art is not None:
+        surface.blit(art, (cx - art.get_width() // 2,
+                           cy - art.get_height() // 2))
+    else:
+        _GLYPHS[ptype](surface, cx, cy, R * 0.68, ow)
 
 
 def render_all_preview(cell=48):
