@@ -50,13 +50,20 @@ STYLE = {"rim": None, "glow": None, "ink": INK, "glyph": GLYPH}
 # ---------------------------------------------------------------------------
 
 
-def _art_dir():
+def _art_dirs():
+    """Art search order: a folder NEXT TO the exe wins (player modding),
+    then the art bundled inside the exe, then the source tree."""
     import sys
+    dirs = []
     if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "assets", "pieces")
+        dirs.append(os.path.join(os.path.dirname(sys.executable),
+                                 "assets", "pieces"))
+        bundled = getattr(sys, "_MEIPASS", None)
+        if bundled:
+            dirs.append(os.path.join(bundled, "assets", "pieces"))
+    dirs.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "assets", "pieces"))
+    return dirs
 
 
 _art_base = {}     # ptype -> Surface | None (loaded once per run)
@@ -69,13 +76,15 @@ def _get_art(ptype, radius):
     if ptype not in _art_base:
         surf = None
         try:
-            path = os.path.join(_art_dir(), "%s.png" % ptype)
-            if os.path.isfile(path):
-                surf = pygame.image.load(path)
-                try:
-                    surf = surf.convert_alpha()
-                except pygame.error:
-                    pass    # no display yet: use the raw surface
+            for d in _art_dirs():
+                path = os.path.join(d, "%s.png" % ptype)
+                if os.path.isfile(path):
+                    surf = pygame.image.load(path)
+                    try:
+                        surf = surf.convert_alpha()
+                    except pygame.error:
+                        pass    # no display yet: use the raw surface
+                    break
         except Exception:
             surf = None
         _art_base[ptype] = surf

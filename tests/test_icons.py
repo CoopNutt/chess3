@@ -181,7 +181,14 @@ class TestStyle(unittest.TestCase):
         self.assertEqual(icons.style_fingerprint(), fp0)
 
     def test_draw_consults_style_every_call(self):
-        """glow/rim/ink/glyph each change the render; reset restores it."""
+        """glow/rim/ink/glyph each change the render; reset restores it.
+
+        Forces the VECTOR glyph path: ink/glyph styling recolors vector
+        linework, not custom art (assets/pieces), so the art loader must
+        be bypassed for K here."""
+        icons.clear_art_cache()
+        icons._art_base["K"] = None       # pretend no art exists for K
+        self.addCleanup(icons.clear_art_cache)
         base = _render_bytes("K")
         # deterministic re-render with default style
         self.assertEqual(_render_bytes("K"), base)

@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 echo === Chess 3 build ===
 python make_icon.py
-python -m PyInstaller --noconfirm --onefile --windowed --name Chess3 --icon chess3.ico main.py
+python -m PyInstaller --noconfirm --onefile --windowed --name Chess3 --icon chess3.ico --add-data "assets;assets" main.py
 if errorlevel 1 (
   echo BUILD FAILED
   exit /b 1
